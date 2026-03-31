@@ -1,0 +1,15 @@
+# Benchmark Results
+benchmark_results.json
+benchmark_single_batch_results.json
+
+# Python environment (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/

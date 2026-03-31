@@ -1,0 +1,70 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: pii-transform-service-protegrity
+  annotations:
+    run.googleapis.com/launch-stage: BETA
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "1"
+    spec:
+      containers:
+        - image: <REGION>-docker.pkg.dev/<PROJECT_ID>/<REPOSITORY>/pii-transform-service-protegrity:latest
+          name: app
+          resources:
+            limits:
+              cpu: "0.25"
+              memory: 512Mi
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PROTEGRITY_SERVER_URL
+              value: "http://localhost:8050"
+            - name: DEV_EDITION_EMAIL
+              value: "<YOUR_PROTEGRITY_DEV_EMAIL>"
+            - name: DEV_EDITION_PASSWORD
+              value: "<YOUR_PROTEGRITY_DEV_PASSWORD>"
+            - name: DEV_EDITION_API_KEY
+              value: "<YOUR_PROTEGRITY_DEV_API_KEY>"
+        
+        - image: <REGION>-docker.pkg.dev/<PROJECT_ID>/<REPOSITORY>/protegrity-classification-service:latest
+          name: classification-service
+          resources:
+            limits:
+              cpu: "0.25"
+              memory: 512Mi
+          startupProbe:
+            tcpSocket:
+              port: 8050
+            failureThreshold: 30
+            periodSeconds: 10
+          env:
+            - name: PROVIDERS
+              value: '[{"name":"Pattern", "address":"http://localhost:8051"}, {"name":"Context", "address":"http://localhost:8052"}]'
+          
+        - image: <REGION>-docker.pkg.dev/<PROJECT_ID>/<REPOSITORY>/protegrity-pattern-provider:latest
+          name: pattern-provider
+          resources:
+            limits:
+              cpu: "4.0"
+              memory: 8Gi
+          startupProbe:
+            tcpSocket:
+              port: 8051
+            failureThreshold: 30
+            periodSeconds: 10
+          
+        - image: <REGION>-docker.pkg.dev/<PROJECT_ID>/<REPOSITORY>/protegrity-context-provider:latest
+          name: context-provider
+          resources:
+            limits:
+              cpu: "1.0"
+              memory: 2Gi
+          startupProbe:
+            tcpSocket:
+              port: 8052
+            failureThreshold: 30
+            periodSeconds: 10
