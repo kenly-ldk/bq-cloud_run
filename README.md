@@ -215,7 +215,7 @@ export BIGQUERY_DATASET="your_dataset"
 python scripts/benchmark_scale.py
 ```
 
-## Performance Plateaus & Sweet Spots
+## End-2-End Performance
 
 Based on automated scale tests for **1 Million Rows** on a single Cloud Run instance with the following configuration:
 *   **Total Pod Size**: 5.5 vCPU, 11 GiB Memory
@@ -223,19 +223,15 @@ Based on automated scale tests for **1 Million Rows** on a single Cloud Run inst
 *   **minScale**: 1 (Pre-warmed to avoid cold starts)
 *   **maxScale**: 1 (Isolated to a single instance for pure benchmarking)
 
-| Batch Size | Latency Avg (s) | Latency Min (s) | Latency Max (s) | Throughput Avg (RPS) | Throughput Min (RPS) | Throughput Max (RPS) |
+| Batch Size | Duration Avg (s) | Duration Min (s) | Duration Max (s) | Throughput Avg (RPS) | Throughput Min (RPS) | Throughput Max (RPS) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 10,000 | 25.65s | 22.65s | 36.60s | ~40,385 | ~27,325 | ~44,146 |
-| 20,000 | 20.77s | 19.47s | 23.54s | ~48,376 | ~42,475 | ~51,369 |
-| 50,000 | 19.85s | 19.41s | 20.18s | **~50,400** | ~49,554 | ~51,509 |
-| 100,000 | 20.87s | 19.63s | 24.90s | ~48,318 | ~40,167 | ~50,945 |
+| 10,000 | 18.50s | 15.83s | 20.82s | ~54,047 | ~48,037 | ~63,167 |
+| 20,000 | 21.26s | 17.22s | 26.13s | ~47,038 | ~38,273 | ~58,058 |
+| 50,000 | 19.85s | 19.41s | 20.18s | ~50,400 | ~49,554 | ~51,509 |
+| 100,000 | 18.29s | 17.61s | 18.90s | **~54,688** | ~52,918 | ~56,789 |
 
-#### The 50,000 Sweet Spot
-The 50,000 batch size represents the point where the payload perfectly utilizes the concurrency window of a single Cloud Run instance. 
-*   **1M rows / 50,000 = 20 requests.**
-*   The Cloud Run instance accepts all 20 requests simultaneously (concurrency = 20), resulting in zero queuing and peak efficiency!
-
-
+### Observation
+Performance is driven by multiple factors. While batch size is a primary lever, Cloud Run connection concurrency, Protegrity Dev server throttling (rate-limiting under sustained bursts), and potential future Cloud Run instance scaling can shift these boundaries.
 
 
 ## Best Practices: Filter Before Detokenization

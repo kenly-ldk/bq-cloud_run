@@ -4,6 +4,7 @@ RETURNS STRING
 REMOTE WITH CONNECTION `<YOUR_PROJECT_ID>.<YOUR_REGION>.pii_transform_conn`
 OPTIONS (
     endpoint='https://pii-transform-service-protegrity-<YOUR_PROJECT_NUMBER>.<YOUR_REGION>.run.app',
+    user_defined_context=[('mode', 'detokenize')],
     max_batching_rows=100
 );
 
@@ -24,6 +25,7 @@ RETURNS STRING
 REMOTE WITH CONNECTION `<YOUR_PROJECT_ID>.<YOUR_REGION>.pii_transform_conn`
 OPTIONS (
   endpoint = 'https://pii-transform-service-protegrity-<YOUR_PROJECT_NUMBER>.<YOUR_REGION>.run.app',
+  user_defined_context=[('mode', 'detokenize')],
   max_batching_rows = 100
 );
 
@@ -33,6 +35,7 @@ RETURNS STRING
 REMOTE WITH CONNECTION `<YOUR_PROJECT_ID>.<YOUR_REGION>.pii_transform_conn`
 OPTIONS (
   endpoint = 'https://pii-transform-service-protegrity-<YOUR_PROJECT_NUMBER>.<YOUR_REGION>.run.app',
+  user_defined_context=[('mode', 'detokenize')],
   max_batching_rows = 1000
 );
 
@@ -42,6 +45,7 @@ RETURNS STRING
 REMOTE WITH CONNECTION `<YOUR_PROJECT_ID>.<YOUR_REGION>.pii_transform_conn`
 OPTIONS (
   endpoint = 'https://pii-transform-service-protegrity-<YOUR_PROJECT_NUMBER>.<YOUR_REGION>.run.app',
+  user_defined_context=[('mode', 'detokenize')],
   max_batching_rows = 5000
 );
 
@@ -51,6 +55,7 @@ RETURNS STRING
 REMOTE WITH CONNECTION `<YOUR_PROJECT_ID>.<YOUR_REGION>.pii_transform_conn`
 OPTIONS (
   endpoint = 'https://pii-transform-service-protegrity-<YOUR_PROJECT_NUMBER>.<YOUR_REGION>.run.app',
+  user_defined_context=[('mode', 'detokenize')],
   max_batching_rows = 10000
 );
 
@@ -60,6 +65,7 @@ RETURNS STRING
 REMOTE WITH CONNECTION `<YOUR_PROJECT_ID>.<YOUR_REGION>.pii_transform_conn`
 OPTIONS (
   endpoint = 'https://pii-transform-service-protegrity-<YOUR_PROJECT_NUMBER>.<YOUR_REGION>.run.app',
+  user_defined_context=[('mode', 'detokenize')],
   max_batching_rows = 50000
 );
 
@@ -69,6 +75,7 @@ RETURNS STRING
 REMOTE WITH CONNECTION `<YOUR_PROJECT_ID>.<YOUR_REGION>.pii_transform_conn`
 OPTIONS (
   endpoint = 'https://pii-transform-service-protegrity-<YOUR_PROJECT_NUMBER>.<YOUR_REGION>.run.app',
+  user_defined_context=[('mode', 'detokenize')],
   max_batching_rows = 100000
 );
 

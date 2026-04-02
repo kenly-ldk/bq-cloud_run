@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
 import os
+import time
+import threading
 import protegrity_developer_python as protegrity
 from protegrity_developer_python.utils.discover import discover
 from protegrity_developer_python.utils.constants import DATA_ELEMENT_MAPPING
@@ -7,15 +9,50 @@ from appython.protector import Protector
 
 app = Flask(__name__)
 
+# Global variables for session caching
+cached_session = None
+last_session_time = 0
+SESSION_CACHE_TTL = 300  # 5 minutes in seconds
+cache_lock = threading.Lock()
+
+def _get_cached_session():
+    """Retrieve or refresh the cached session in a thread-safe manner."""
+    global cached_session, last_session_time
+    current_time = time.time()
+    
+    # Fast check without lock
+    if cached_session is None or (current_time - last_session_time) > SESSION_CACHE_TTL:
+        with cache_lock:
+            # Double check inside lock to avoid race conditions
+            if cached_session is None or (current_time - last_session_time) > SESSION_CACHE_TTL:
+                try:
+                    local_protector = Protector()
+                    new_session = local_protector.create_session("superuser")
+                    cached_session = new_session
+                    last_session_time = current_time
+                    print("Successfully created/refreshed cached session.", flush=True)
+                except Exception as e:
+                    print(f"Failed to refresh cached session: {e}", flush=True)
+                    if cached_session is None:
+                        raise e  # If we have NO session at all, we must fail
+    return cached_session
+
+def invalidate_cache(failed_session):
+    """Force invalidate the cache on session failures, only if it matches the failed session."""
+    global cached_session, last_session_time
+    with cache_lock:
+        if cached_session is failed_session:
+            cached_session = None
+            last_session_time = 0
+            print("Forced invalidation of cached session.", flush=True)
+        else:
+            print("Ignoring invalidation request for a non-matching session.", flush=True)
+
+
 # Initialize Protegrity low-level SDK session
-try:
-    protector = Protector()
-    pty_session = protector.create_session("superuser") 
-    print("Protegrity direct session initialized successfully.")
-    session_ok = True
-except Exception as e:
-    print(f"Error initializing Protegrity direct session: {e}")
-    session_ok = False
+# We no longer do a synchronous startup session check to avoid consuming rate limits on instance starts.
+# Healthy status will be determined on-demand as requests are processed.
+session_ok = True
 
 # Initialize Protegrity high-level (for discovery setup if needed)
 try:
@@ -60,19 +97,26 @@ def _process_bulk_pii(calls, data_element_from_context, session_ok, mode='detoke
 
     replies = [None] * len(calls)
     
-    if session_ok:
+    # Retrieve session from cache (thread-safe)
+    active_session = _get_cached_session()
+
+    if session_ok or active_session:
          for de, items in by_element.items():
               indices = [item[0] for item in items]
               vals = [item[1] for item in items]
               try:
                    if mode == 'tokenize':
-                        protected_vals, errors = pty_session.protect(vals, de)
+                        protected_vals, errors = active_session.protect(vals, de)
                    else:
-                        protected_vals, errors = pty_session.unprotect(vals, de)
+                        protected_vals, errors = active_session.unprotect(vals, de)
                    for idx, u_val in zip(indices, protected_vals):
                         replies[idx] = u_val
               except Exception as e:
-                   print(f"Bulk unprotect failed for {de}: {e}")
+                   print(f"Bulk unprotect failed for {de}: {e}", flush=True)
+                   # Force invalidate cache if it looks like a session failure
+                   err_str = str(e).lower()
+                   if "session" in err_str or "forbidden" in err_str or "unauthorized" in err_str:
+                        invalidate_cache(active_session)
                    for idx in indices:
                         replies[idx] = f"error_{de}"
     else:
@@ -92,7 +136,14 @@ def process_pii():
         mode = None
         if user_context:
              items = user_context.items() if isinstance(user_context, dict) else user_context
-             for k, v in items:
+             for item in items:
+                  if isinstance(item, (list, tuple)) and len(item) >= 2:
+                       k, v = item[0], item[1]
+                  elif isinstance(item, dict):
+                       k, v = item.get('key'), item.get('value')
+                  else:
+                       continue
+                       
                   if k == 'data_element':
                        data_element_from_context = v
                   elif k == 'mode':
@@ -121,7 +172,6 @@ def tokenize_pii_bulk():
         pty_session = protector.create_session("superuser")
     except Exception as e:
         print(f"Failed to create session in /tokenize_bulk: {e}")
-        # continue and hope old session works
 
     try:
         req = request.get_json()
@@ -154,7 +204,7 @@ def tokenize_pii_bulk():
 
         replies = [None] * len(calls)
         
-        if True: # session_ok check omitted for simplicity, assume ok if create_session didn't raise
+        if True:
              for de, items in by_element.items():
                  indices = [item[0] for item in items]
                  vals = [item[1] for item in items]
