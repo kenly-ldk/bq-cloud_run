@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Turn raw sweep JSONL into the markdown tables that go in docs/.
 
-    python fpe/scripts/analyze.py fpe/scripts/sweep_raw_all.jsonl
-    python fpe/scripts/analyze.py fpe/scripts/*.jsonl --out docs/results/tables.md
+    python fpe/scripts/analyze.py fpe/results/sweep_raw_all.jsonl
+    python fpe/scripts/analyze.py fpe/results/*.jsonl --out fpe/results/tables.md
 
 Iterations are collapsed with the median, not the mean: Cloud Run cold-ish
 instances and BigQuery slot contention both produce occasional long tails that

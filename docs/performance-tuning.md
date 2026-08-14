@@ -2,8 +2,8 @@
 
 Everything below was measured on real infrastructure (project `<PROJECT_ID>`,
 `us-central1`, August 2026) using [`fpe/scripts/sweep.py`](../fpe/scripts/sweep.py).
-Raw records are JSONL under `fpe/scripts/sweep_raw_*.jsonl`; regenerate any
-table with `python fpe/scripts/analyze.py <file>`.
+Raw records are JSONL under [`fpe/results/`](../fpe/results/); regenerate any
+table with `python fpe/scripts/analyze.py fpe/results/<file>`.
 
 **Workload.** FF3-1 format-preserving encryption in pure Python — ~77 µs/row on
 one core, i.e. genuinely CPU-bound. That is deliberate: a cheap workload would
@@ -643,7 +643,7 @@ is already entitled to the row, which the join above guarantees.
 ## 7. Cloud Run tuning
 
 400,000 rows, `fpe_decrypt`, median of 2 iterations. Full tables in
-[`results/perf-tables.md`](results/perf-tables.md).
+[`../fpe/results/perf-tables.md`](../fpe/results/perf-tables.md).
 
 ### `containerConcurrency` vs the worker model — all at 4 vCPU
 
@@ -748,6 +748,47 @@ non-knob** above ~1,000. Tune workers and instances instead.
 
 ---
 
+## Does this apply to the Protegrity demo?
+
+Mostly yes. The measurements were taken with the FPE service, but almost every
+finding is a property of **BigQuery's remote function protocol**, not of what
+the service does with a value once it arrives. Anything in this document that
+concerns the BigQuery side transfers unchanged to
+[`protegrity/`](../protegrity/) — or to any other remote function you write.
+
+**Transfers unchanged** — these are BigQuery-side behaviours:
+
+| Section | Why it transfers |
+| --- | --- |
+| §1 batch cap (~256 KiB) | BigQuery sizes the request before contacting any service |
+| §2 limits (15 MB response, 20 retries, 10 concurrent queries) | Enforced by BigQuery |
+| §3 short-circuit batching cliff | A query-planning behaviour |
+| §4 call placement | Query planning again |
+| §5 search by tokenizing the term | Needs only *deterministic* tokenization, which Protegrity FPE/tokenization data elements are by default |
+| §6 access-control patterns | Pure SQL shapes; swap `fpe_decrypt` for `pii_detokenize_fpe_multi` |
+
+**Does not transfer** — §7, and this is the important caveat. The two services
+have opposite performance profiles:
+
+| | FPE service | Protegrity service |
+| --- | --- | --- |
+| Work per row | FF3-1 in-process, ~77 µs | HTTP call to a vendor API |
+| Bound by | **CPU** | **Network / vendor latency** |
+| Transit share of end-to-end | ~6% | dominant |
+
+So §7's central conclusion **inverts**. For the CPU-bound FPE service, gunicorn
+*processes* buy parallelism and threads are actively harmful (the GIL). For the
+Protegrity service, each request spends its time blocked on a socket, which
+*releases* the GIL — so threads would help there and adding processes mostly
+wastes memory. Do not copy the FPE worker-model numbers into a Protegrity
+deployment; re-run `--phase concurrency` against it.
+
+Two further Protegrity-only concerns with no FPE analogue: the vendor API's own
+rate limiting under sustained load, and session lifetime (the service caches a
+session for 5 minutes, see [`main.py`](../protegrity/service/main.py)).
+
+---
+
 ## Practical checklist
 
 Ordered by the size of the effect measured here.
@@ -785,7 +826,7 @@ python fpe/scripts/sweep.py --list                 # plan only, deploys nothing
 python fpe/scripts/sweep.py --phase all            # infrastructure sweep
 python fpe/scripts/sweep.py --phase limits         # documented limits
 python fpe/scripts/sweep.py --phase access_control # authorized-view shapes
-python fpe/scripts/analyze.py fpe/scripts/sweep_raw_*.jsonl
+python fpe/scripts/analyze.py fpe/results/sweep_raw_*.jsonl
 ```
 
 ## Caveats

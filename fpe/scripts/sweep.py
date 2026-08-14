@@ -1062,7 +1062,7 @@ def main() -> int:
         return 0
 
     out_path = Path(args.out) if args.out else (
-        REPO_ROOT / "fpe" / "scripts" / f"sweep_raw_{args.phase}.jsonl"
+        REPO_ROOT / "fpe" / "results" / f"sweep_raw_{args.phase}.jsonl"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sink = out_path.open("a")

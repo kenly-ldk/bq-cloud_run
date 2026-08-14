@@ -4,28 +4,43 @@ Two independent demos of calling a Cloud Run service from BigQuery via a
 [remote function](https://docs.cloud.google.com/bigquery/docs/remote-functions),
 plus a measured study of how the thing actually performs.
 
-| Demo | Crypto | External dependency | Use it when |
+| Demo | Crypto | External dependency | Status |
 | --- | --- | --- | --- |
-| [`fpe/`](fpe/) | FF3-1 format-preserving encryption, in-process | **None** | You want a runnable demo, or you want to study tuning and limits |
-| [`protegrity/`](protegrity/) | Protegrity PEP (vendor) | Protegrity API credentials | You have a Protegrity entitlement and want the vendor integration |
+| [`fpe/`](fpe/) | FF3-1 format-preserving encryption, in-process | **None** | **Active** — deployed, tested, benchmarked |
+| [`protegrity/`](protegrity/) | Protegrity PEP (vendor) | Protegrity API credentials | ⚠️ **Unmaintained** — see below |
 
 Both speak the same BigQuery remote function protocol and both are deployed to
 Cloud Run; they differ only in what happens to a value once it arrives.
+
+> [!WARNING]
+> **`protegrity/` is unmaintained and unverified.** The Protegrity API access it
+> needs is no longer available, so nothing in it has been deployed or tested
+> since. Its benchmark numbers are known to be unreliable, and it contains at
+> least one route that would crash on call. It is kept as a reference for the
+> vendor integration only — [see its README](protegrity/README.md) for the
+> specific issues.
+>
+> **Start with [`fpe/`](fpe/).** It exercises the identical BigQuery →
+> Cloud Run remote function path without any vendor dependency.
+
+Most of the performance study applies to both demos, because most of it is
+about BigQuery's protocol rather than the crypto —
+[which parts transfer, and which don't](docs/performance-tuning.md#does-this-apply-to-the-protegrity-demo).
 
 ## Layout
 
 ```text
 ├── config/                   # shared.env contract (see below)
 ├── docs/
-│   ├── performance-tuning.md # the concurrency + limits study — start here
-│   └── results/              # generated result tables
+│   └── performance-tuning.md # the study — applies to BOTH demos, start here
 ├── shared/
 │   └── generate_mock_data.py # PII mock data generator, used by both demos
-├── fpe/                      # vendor-free demo
+├── fpe/                      # vendor-free demo, and the measurement rig
 │   ├── service/              # Flask app, FF3-1 engine, Dockerfile, Knative template
 │   ├── sql/                  # generated remote functions + access-control patterns
-│   └── scripts/              # provision / build / deploy / sweep / analyze
-└── protegrity/               # vendor demo (unchanged, still requires API access)
+│   ├── scripts/              # provision / build / deploy / sweep / analyze
+│   └── results/              # generated result tables + raw JSONL
+└── protegrity/               # ⚠️ unmaintained vendor demo, kept for reference
     ├── service/              # Flask app + vendored appython & developer SDKs
     ├── sql/
     └── scripts/
@@ -82,7 +97,7 @@ part of this repo. It measures, on real infrastructure:
 - what `max_batching_rows` actually does (BigQuery caps it far below what you ask);
 - why `containerConcurrency` alone buys nothing for CPU-bound Python;
 - every documented remote-function limit, probed until it breaks;
-- the query shapes that silently disable batching and cost you ~200x;
+- the query shapes that silently disable batching and cost you ~180x;
 - authorized-view + entitlement patterns for row- and column-level access
   control that keep batching intact.
 

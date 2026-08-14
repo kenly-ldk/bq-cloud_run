@@ -100,7 +100,7 @@ python scripts/sweep.py --phase batch             # max_batching_rows
 python scripts/sweep.py --phase concurrency       # concurrency x worker model
 python scripts/sweep.py --phase limits            # all documented BQ limits
 python scripts/sweep.py --phase access_control    # authorized-view shapes
-python scripts/analyze.py scripts/sweep_raw_*.jsonl --out ../docs/results/tables.md
+python scripts/analyze.py results/sweep_raw_*.jsonl --out results/tables.md
 ```
 
 Each phase deploys revisions, runs queries, and records both BigQuery job stats

@@ -1,5 +1,31 @@
 # BigQuery + Protegrity Cloud Run Integration
 
+> [!WARNING]
+> **Unmaintained and unverified. Requires Protegrity API access we no longer have.**
+>
+> Nothing in this directory has been deployed or tested since that access
+> lapsed. It is kept as a reference for the vendor integration, but treat every
+> instruction and every number below as unverified.
+>
+> Known issues, found by inspection rather than testing:
+> - **The benchmark tables below are unreliable.** They compare batch sizes from
+>   10,000 to 100,000, but BigQuery caps a request at ~11,905 rows for this row
+>   width, so those configurations were identical. See
+>   [§1 of the performance study](../docs/performance-tuning.md).
+> - **`/tokenize_bulk` would crash.** It references a global `protector` that no
+>   longer exists ([`main.py`](service/main.py)) — a `NameError` on first
+>   request. Nothing routes to it; `mode=tokenize` goes through `/`.
+> - **The sidecars are not on the hot path.** The manifest provisions 5.5 vCPU
+>   across three Protegrity containers, but `appython` calls the *remote*
+>   Developer Edition API at `api.developer-edition.protegrity.com`. The
+>   localhost sidecars serve discovery only, which nothing here invokes.
+> - **Credentials are plaintext env vars** in the manifest. Use Secret Manager.
+>
+> **For a runnable demo, use [`../fpe/`](../fpe/) instead** — same BigQuery
+> remote function architecture, FF3-1 encryption in-process, no vendor
+> dependency. Most of what the study found applies here too; see
+> [does this apply to the Protegrity demo?](../docs/performance-tuning.md#does-this-apply-to-the-protegrity-demo)
+
 This repository provides a template and guide for integrating BigQuery with Protegrity (Format Preserving Encryption - FPE) using BigQuery Remote Functions and a Cloud Run sidecar architecture.
 
 ## Architecture
