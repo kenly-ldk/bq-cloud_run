@@ -509,13 +509,13 @@ Grouped by scenario, naive shape first in each:
 
 | Scenario | Pattern | What it is | Elapsed | Speed-up | HTTP requests | Rows to service |
 | --- | --- | --- | --- | --- | --- | --- |
-| **1.** Mask one column<br>*(all rows returned)* | **A** — naive<br>[`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L65) | entitlement inside a `CASE` arm | 29.44s | — | 975 | 975 |
-| | **B** — fix<br>[`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L84) | `UNION ALL` of two unconditional branches | **1.40s** | **21x** | **1** | 987 |
-| **2.** Mask three columns<br>*(all rows returned)* | **D-naive** — naive<br>[`sweep.py`](../fpe/scripts/sweep.py#L655) | three nested `CASE` expressions | 52.47s | — | 1,953 | 1,953 |
-| | **D** — fix<br>[`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L148) | per-column CTE + `LEFT JOIN` back | **1.67s** | **31x** | 74 | 1,816 |
-| **3.** Low-cardinality column<br>*(all entitled rows)* | **E-naive** — naive<br>[`v_name_naive`](../fpe/sql/access_control_patterns.sql#L222) | decode every row | 12.73s | — | 101 | 500,409 |
-| | **E** — fix<br>[`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L204) | decode `DISTINCT` tokens, join back | **2.05s** | **6.2x** | **1** | **63** |
-| **4.** Row-level only<br>*(fewer rows returned)* | **C**<br>[`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L114) | entitlement as a join predicate | 1.37s | n/a | 1 | 987 |
+| **1.** Mask one column<br>*(all rows returned)* | **A** — naive<br>[`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L65) | entitlement inside a `CASE` arm | 29.93s | — | 987 | 987 |
+| | **B** — fix<br>[`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L84) | `UNION ALL` of two unconditional branches | **0.99s** | **30x** | **1** | 987 |
+| **2.** Mask three columns<br>*(all rows returned)* | **D-naive** — naive<br>[`sweep.py`](../fpe/scripts/sweep.py#L655) | three nested `CASE` expressions | 51.75s | — | 1,974 | 1,974 |
+| | **D** — fix<br>[`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L148) | per-column CTE + `LEFT JOIN` back | **1.64s** | **32x** | 74 | 1,826 |
+| **3.** Low-cardinality column<br>*(all entitled rows)* | **E-naive** — naive<br>[`v_name_naive`](../fpe/sql/access_control_patterns.sql#L222) | decode every row | 12.18s | — | 99 | 490,409 |
+| | **E** — fix<br>[`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L204) | decode `DISTINCT` tokens, join back | **1.01s** | **12x** | **1** | **63** |
+| **4.** Row-level only<br>*(fewer rows returned)* | **C**<br>[`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L114) | entitlement as a join predicate | 1.01s | n/a | 1 | 987 |
 
 Within each scenario the two shapes return **identical results** — the benchmark
 asserts it rather than claiming it, and A vs B, D vs D-naive and E vs E-naive
@@ -526,12 +526,6 @@ column, so it has no naive counterpart to beat.
 Do not compare elapsed times *across* scenarios. Scenarios 1, 2 and 4 run over a
 ~1,950-row slice; scenario 3 runs over the full entitled half of the 1M-row
 table. Only the within-scenario ratios are meaningful.
-
-> **Provenance note.** Pattern E's `1 request / 63 rows` comes from a follow-up
-> measurement, not from `sweep_raw_patterns.jsonl`, which records `0` for both.
-> The original run's log window closed before Cloud Logging ingested the single
-> small request. The harness now waits `LOG_SETTLE_S = 20` for exactly this
-> reason; a zero in a raw record means "not observed", never "did not happen".
 
 ### A vs B — they are not the same query
 
@@ -576,8 +570,8 @@ never invoked for it — in the measured run `email` was ungranted and cost noth
 
 Determinism means a column with C distinct values across R rows needs C
 decryptions, not R. For `name` (63 distinct tokens in the entitled half of 1M
-rows) that is **63 rows through the service instead of 500,409** — a 7,900x
-reduction, 6.2x faster wall-clock. Only worth it when C ≪ R; for near-unique
+rows) that is **63 rows through the service instead of 490,409** — a 7,800x
+reduction, and 12x faster wall-clock. Only worth it when C ≪ R; for near-unique
 columns like `ssn` the `DISTINCT` and join cost more than they save.
 
 ### Hardening
@@ -706,8 +700,8 @@ Ordered by the size of the effect measured here.
 1. **Never put a remote function inside `CASE`/`IF`/`MERGE ... WHEN`** (~180x).
    Use `UNION ALL` of unconditional branches, or filter first. Hoisting into a
    subquery does *not* work.
-2. **Decode distinct values, not rows**, for low-cardinality columns (7,900x
-   fewer rows through the service on a 63-distinct-value column).
+2. **Decode distinct values, not rows**, for low-cardinality columns (7,800x
+   fewer rows through the service on a 63-distinct-value column, 12x faster).
 3. **Search by tokenizing the term**, bound via `DECLARE`/`SET` (~9x, and
    960,000 → 1 row through the function). Better still, have the caller supply
    an already-known token: that query contains no remote function at all, so it

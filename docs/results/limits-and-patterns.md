@@ -27,17 +27,11 @@
 | Queries fired | Succeeded | Wall (s) | Aggregate rows/s | Quota error |
 | --- | --- | --- | --- | --- |
 | 1 | 1/1 | 3.1 | 6,543 | no |
-| 1 | 1/1 | 18.4 | 54,202 | no |
 | 2 | 2/2 | 3.9 | 10,326 | no |
-| 2 | 2/2 | 25.9 | 77,352 | no |
 | 4 | 4/4 | 4.0 | 20,244 | no |
-| 4 | 4/4 | 55.3 | 72,352 | no |
 | 8 | 8/8 | 3.9 | 40,777 | no |
-| 8 | 8/8 | 102.1 | 78,366 | no |
 | 10 | 10/10 | 4.5 | 44,432 | no |
-| 10 | 10/10 | 128.1 | 78,058 | no |
 | 12 | 12/12 | 5.6 | 42,893 | no |
-| 12 | 12/12 | 129.2 | 92,882 | no |
 | 16 | 16/16 | 6.9 | 46,113 | no |
 | 16 | 16/16 | 164.4 | 97,326 | no |
 
@@ -77,20 +71,16 @@
 
 | Pattern | Result | Elapsed (s) | HTTP requests | Rows to service | Median rows/request |
 | --- | --- | --- | --- | --- | --- |
-| `A_case_masking` | OK | 35.04 | 964 | 964 | 1 |
-| `B_union_all_masking` | OK | 0.78 | 1 | 987 | 987 |
-| `C_row_filter` | OK | 0.84 | 1 | 987 | 987 |
-| `A_case_masking` | OK | 29.44 | 975 | 975 | 1 |
-| `B_union_all_masking` | OK | 1.40 | 1 | 987 | 987 |
-| `C_row_filter` | OK | 1.37 | 1 | 987 | 987 |
-| `D_row_and_column` | OK | 1.67 | 74 | 1,816 | 24 |
-| `D_naive_case_3col` | OK | 52.47 | 1,953 | 1,953 | 1 |
-| `E_name_dedup` | OK | 2.05 | 0 | — | — |
-| `E_name_naive` | OK | 12.73 | 101 | 500,409 | 5,000 |
+| `A_case_masking` | OK | 29.93 | 987 | 987 | 1 |
+| `B_union_all_masking` | OK | 0.99 | 1 | 987 | 987 |
+| `C_row_filter` | OK | 1.01 | 1 | 987 | 987 |
+| `D_row_and_column` | OK | 1.64 | 74 | 1,826 | 24 |
+| `D_naive_case_3col` | OK | 51.75 | 1,974 | 1,974 | 1 |
+| `E_name_dedup` | OK | 1.01 | 1 | 63 | 63 |
+| `E_name_naive` | OK | 12.18 | 99 | 490,409 | 5,000 |
 
 Result-equivalence checks:
 
-- `A_vs_B`: 0 mismatches of 1947 rows — **equivalent**
 - `A_vs_B`: 0 mismatches of 1947 rows — **equivalent**
 - `D_vs_naive_case`: 0 mismatches of 987 rows — **equivalent**
 - `E_dedup_vs_naive`: 0 mismatches of 987 rows — **equivalent**
