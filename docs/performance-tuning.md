@@ -207,11 +207,58 @@ headroom than the number "10" suggests.
 ## 3. The batching cliff
 
 BigQuery disables batching when a remote function sits inside a short-circuiting
-expression — the docs say `calls` then "has exactly one element".
+expression. The documented wording is: *"If evaluation is short-circuited (e.g.
+conditional expressions, `MERGE ... WHEN [NOT] MATCHED`), batching is disabled
+and the `calls` field has exactly one element."*
 
-All four shapes below do the same conceptual work: decrypt `ssn` for the half of
-the rows where `MOD(id, 2) = 0`. They differ only in *where the conditional
-sits* relative to the function call. Source:
+### What "`calls` has exactly one element" means
+
+`calls` is the JSON array in the request body BigQuery POSTs to your service.
+**Each element of that array is one row's arguments**, so the length of `calls`
+*is* the batch size:
+
+```jsonc
+{
+  "requestId": "124ab1c",
+  "userDefinedContext": { "mode": "fpe_decrypt" },
+  "calls": [                        // 3 elements = 3 rows in this one request
+    ["123-45-6789", "ssn"],
+    ["987-65-4321", "ssn"],
+    ["555-11-2222", "ssn"]
+  ]
+}
+```
+
+Your service returns a `replies` array of the same length and order. This is
+what `max_batching_rows` caps and what the ~256 KiB budget in §1 constrains —
+how many elements BigQuery is willing to put in `calls`.
+
+"Exactly one element" therefore means every request degenerates to:
+
+```jsonc
+{ "calls": [ ["123-45-6789", "ssn"] ] }
+```
+
+One row per request — **one full HTTP round trip per row**, each paying TCP/TLS,
+HTTP framing, JSON parsing and the ~232-byte envelope in order to transform a
+single 11-character string.
+
+BigQuery does this to keep the semantics of `CASE`/`IF` honest: those constructs
+promise the function is never evaluated for a row failing the condition, and
+BigQuery preserves that by walking the conditional row by row rather than
+gathering qualifying rows and batching them. Correctness is preserved; batching
+is the casualty.
+
+The `Rows/request` column below is the measured median length of `calls`: the
+service reads it at [`main.py:206`](../fpe/service/main.py#L206) and logs
+`len(calls)` per request at [`main.py:244`](../fpe/service/main.py#L244). These
+are counted, not inferred from timings.
+
+### The four shapes
+
+All four do the same conceptual work: decrypt `ssn` for the half of the rows
+where `MOD(id, 2) = 0`. They differ only in *where the conditional sits*
+relative to the function call. Source:
 [`sweep.py:365`](../fpe/scripts/sweep.py#L365).
 
 **1. `plain` — unconditional baseline** ([`sweep.py:380`](../fpe/scripts/sweep.py#L380))
