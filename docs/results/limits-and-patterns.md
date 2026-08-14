@@ -71,13 +71,16 @@
 
 | Pattern | Result | Elapsed (s) | HTTP requests | Rows to service | Median rows/request |
 | --- | --- | --- | --- | --- | --- |
-| `A_case_masking` | OK | 29.93 | 987 | 987 | 1 |
-| `B_union_all_masking` | OK | 0.99 | 1 | 987 | 987 |
-| `C_row_filter` | OK | 1.01 | 1 | 987 | 987 |
-| `D_row_and_column` | OK | 1.64 | 74 | 1,826 | 24 |
-| `D_naive_case_3col` | OK | 51.75 | 1,974 | 1,974 | 1 |
-| `E_name_dedup` | OK | 1.01 | 1 | 63 | 63 |
-| `E_name_naive` | OK | 12.18 | 99 | 490,409 | 5,000 |
+| `A_case_masking` | OK | 25.78 | 987 | 987 | 1 |
+| `B_union_all_masking` | OK | 0.79 | 1 | 987 | 987 |
+| `C_row_filter` | OK | 0.96 | 1 | 987 | 987 |
+| `D_row_and_column` | OK | 1.59 | 76 | 1,885 | 24 |
+| `D_naive_case_3col` | OK | 50.74 | 1,974 | 1,974 | 1 |
+| `E_name_dedup` | OK | 0.95 | 1 | 63 | 63 |
+| `E_name_naive` | OK | 13.46 | 101 | 500,409 | 5,000 |
+| `F_naive_filter_on_plaintext` | OK | 20.52 | 200 | 1,000,000 | 5,000 |
+| `F_filter_on_token` | OK | 1.79 | 1 | 1 | 1 |
+| `F_caller_supplies_token` | OK | 0.42 | 0 | — | — |
 
 Result-equivalence checks:
 

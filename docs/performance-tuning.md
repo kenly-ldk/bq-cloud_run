@@ -509,13 +509,16 @@ Grouped by scenario, naive shape first in each:
 
 | Scenario | Pattern | What it is | Elapsed | Speed-up | HTTP requests | Rows to service |
 | --- | --- | --- | --- | --- | --- | --- |
-| **1.** Mask one column<br>*(all rows returned)* | **A** — naive<br>[`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L65) | entitlement inside a `CASE` arm | 29.93s | — | 987 | 987 |
-| | **B** — fix<br>[`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L84) | `UNION ALL` of two unconditional branches | **0.99s** | **30x** | **1** | 987 |
-| **2.** Mask three columns<br>*(all rows returned)* | **D-naive** — naive<br>[`sweep.py`](../fpe/scripts/sweep.py#L655) | three nested `CASE` expressions | 51.75s | — | 1,974 | 1,974 |
-| | **D** — fix<br>[`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L148) | per-column CTE + `LEFT JOIN` back | **1.64s** | **32x** | 74 | 1,826 |
-| **3.** Low-cardinality column<br>*(all entitled rows)* | **E-naive** — naive<br>[`v_name_naive`](../fpe/sql/access_control_patterns.sql#L222) | decode every row | 12.18s | — | 99 | 490,409 |
-| | **E** — fix<br>[`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L204) | decode `DISTINCT` tokens, join back | **1.01s** | **12x** | **1** | **63** |
-| **4.** Row-level only<br>*(fewer rows returned)* | **C**<br>[`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L114) | entitlement as a join predicate | 1.01s | n/a | 1 | 987 |
+| **1.** Mask one column<br>*(all rows returned)* | **A** — naive<br>[`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L71) | entitlement inside a `CASE` arm | 25.78s | — | 987 | 987 |
+| | **B** — fix<br>[`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L89) | `UNION ALL` of two unconditional branches | **0.79s** | **33x** | **1** | 987 |
+| **2.** Mask three columns<br>*(all rows returned)* | **D-naive** — naive<br>[`v_row_and_column_naive`](../fpe/sql/access_control_patterns.sql#L125) | one `CASE` per governed column | 50.74s | — | 1,974 | 1,974 |
+| | **D** — fix<br>[`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L158) | per-column CTE + `LEFT JOIN` back | **1.59s** | **32x** | 76 | 1,885 |
+| **3.** Low-cardinality column<br>*(all entitled rows)* | **E-naive** — naive<br>[`v_name_naive`](../fpe/sql/access_control_patterns.sql#L211) | decode every row | 13.46s | — | 101 | 500,409 |
+| | **E** — fix<br>[`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L231) | decode `DISTINCT` tokens, join back | **0.95s** | **14x** | **1** | **63** |
+| **4.** Row-level only<br>*(fewer rows returned)* | **C**<br>[`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L260) | entitlement as a join predicate | 0.96s | n/a | 1 | 987 |
+| **5.** Point lookup by plaintext<br>*(one record)* | **F-naive** — naive<br>[`v_lookup_naive`](../fpe/sql/access_control_patterns.sql#L296) | filter on the decrypted column | 20.52s | — | 200 | 1,000,000 |
+| | **F** — fix<br>[`v_lookup_by_token`](../fpe/sql/access_control_patterns.sql#L324) | tokenize term, filter on ciphertext | **1.79s** | **11x** | **1** | **1** |
+| | **F** — caller holds token | same view, token supplied by caller | **0.42s** | **49x** | **0** | **0** |
 
 Within each scenario the two shapes return **identical results** — the benchmark
 asserts it rather than claiming it, and A vs B, D vs D-naive and E vs E-naive
@@ -527,13 +530,16 @@ Do not compare elapsed times *across* scenarios. Scenarios 1, 2 and 4 run over a
 ~1,950-row slice; scenario 3 runs over the full entitled half of the 1M-row
 table. Only the within-scenario ratios are meaningful.
 
-### A vs B — they are not the same query
+### A vs C — masking and filtering are different semantics
 
-An important correction if you're reading this as guidance: **A and C are not
-interchangeable.** `CASE` masking returns every row with the column masked
-(column-level control). A row filter returns fewer rows (row-level control).
+An important distinction if you're reading this as guidance: **A and C are not
+interchangeable.** `CASE` masking (A) returns every row with the column masked —
+column-level control. A row filter (C) returns fewer rows — row-level control.
+C is faster than A, but it is not a faster *A*; it answers a different question.
+
 Only **B** is result-equivalent to A: a `UNION ALL` of two unconditional
-branches, one detokenizing the entitled rows, one emitting the mask.
+branches, one detokenizing the entitled rows, one emitting the mask. That is why
+the table pairs A with B, and lists C on its own as scenario 4.
 
 ### D — row *and* column control that scales
 
@@ -570,9 +576,58 @@ never invoked for it — in the measured run `email` was ungranted and cost noth
 
 Determinism means a column with C distinct values across R rows needs C
 decryptions, not R. For `name` (63 distinct tokens in the entitled half of 1M
-rows) that is **63 rows through the service instead of 490,409** — a 7,800x
-reduction, and 12x faster wall-clock. Only worth it when C ≪ R; for near-unique
+rows) that is **63 rows through the service instead of 500,409** — a 7,900x
+reduction, and 14x faster wall-clock. Only worth it when C ≪ R; for near-unique
 columns like `ssn` the `DISTINCT` and join cost more than they save.
+
+### F — point lookup by plaintext, combining §5 and §6
+
+The shape most user-facing traffic actually takes: *"show me this one person's
+record, if I'm allowed to see it."* It needs the search pattern from §5 and the
+access control from §6 at the same time, and they pull against each other — an
+authorized view must detokenize to be useful, but a lookup must filter *before*
+detokenizing or it decrypts the whole table.
+
+The naive query looks entirely reasonable:
+
+```sql
+SELECT * FROM v_lookup_naive WHERE ssn = '123-45-6789';   -- 20.52s
+```
+
+The predicate references the view's *decrypted* column, so it cannot be
+evaluated until decryption has happened. **1,000,000 rows crossed the wire** —
+the entire table, not merely the entitled half — to return one record.
+
+The resolution is one extra column: the view projects the raw token alongside
+the decrypted value, so callers can filter on ciphertext.
+
+```sql
+CREATE VIEW v_lookup_by_token AS
+SELECT t.id, t.ssn AS ssn_token,                    -- <- the enabling column
+       fpe_decrypt_b5000(t.ssn, 'ssn') AS ssn
+FROM v_tokenized_branched t
+JOIN entitlements e ON e.user_email = SESSION_USER()
+                   AND e.branch_id = t.branch_id AND e.can_see_ssn;
+
+DECLARE tok STRING;
+SET tok = (SELECT fpe_encrypt('123-45-6789', 'ssn'));
+SELECT * FROM v_lookup_by_token WHERE ssn_token = tok;    -- 1.79s
+```
+
+**1 row through the service instead of 1,000,000**, 11x faster, with the
+entitlement join still enforcing access. This works because of the §4 finding
+that BigQuery pushes simple `WHERE` predicates through a remote function: the
+predicate on `ssn_token` is applied before the decryption in the projection, so
+only the matching row is ever decrypted.
+
+And when the caller already holds the token (§5), the query contains no remote
+function at all — **0.42s, zero invocations**, and it does not count against the
+10-concurrent-query limit.
+
+The trade-off is that the view now exposes ciphertext. That is not plaintext,
+but under deterministic tokenization a token is a stable pseudonymous identifier
+that permits correlation across datasets — so project it only where the caller
+is already entitled to the row, which the join above guarantees.
 
 ### Hardening
 
@@ -700,12 +755,14 @@ Ordered by the size of the effect measured here.
 1. **Never put a remote function inside `CASE`/`IF`/`MERGE ... WHEN`** (~180x).
    Use `UNION ALL` of unconditional branches, or filter first. Hoisting into a
    subquery does *not* work.
-2. **Decode distinct values, not rows**, for low-cardinality columns (7,800x
-   fewer rows through the service on a 63-distinct-value column, 12x faster).
+2. **Decode distinct values, not rows**, for low-cardinality columns (7,900x
+   fewer rows through the service on a 63-distinct-value column, 14x faster).
 3. **Search by tokenizing the term**, bound via `DECLARE`/`SET` (~9x, and
-   960,000 → 1 row through the function). Better still, have the caller supply
-   an already-known token: that query contains no remote function at all, so it
-   escapes the 10-concurrent-query limit entirely.
+   960,000 → 1 row through the function). Through an authorized view, project
+   the token column so lookups can filter on ciphertext (§6 pattern F: 11x,
+   1,000,000 → 1 row). Better still, have the caller supply an already-known
+   token: that query contains no remote function at all, so it escapes the
+   10-concurrent-query limit entirely.
 4. **Scale horizontally.** `maxScale` 1→8 gave 3.2x; it beats vCPU per unit of
    effort and avoids worker oversubscription.
 5. **Set gunicorn workers = vCPU** for CPU-bound work; `containerConcurrency` a

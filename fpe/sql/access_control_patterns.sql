@@ -17,19 +17,21 @@
 --   element". One HTTP round trip per row.
 --   https://docs.cloud.google.com/bigquery/docs/remote-functions#limitations
 --
--- Measured results for every pattern below are in docs/performance-tuning.md
--- section 6, which groups them into scenarios. This file uses the same labels:
+-- Measured results are in docs/performance-tuning.md section 6. This file is
+-- ordered to match that section's table: scenario by scenario, naive first.
 --
---   Scenario                          Naive                  Fix
---   -------------------------------   --------------------   --------------------
---   1. Mask one column                A  v_ssn_case          B  v_ssn_union
---   2. Mask three columns             D-naive (see below)    D  v_row_and_column
---   3. Low-cardinality column         E-naive v_name_naive   E  v_name_dedup
---   4. Row-level only (fewer rows)    -- no counterpart --   C  v_ssn_rowfilter
+--   Scenario                          Naive                        Fix
+--   -------------------------------   --------------------------   ------------------------
+--   1. Mask one column                A       v_ssn_case           B  v_ssn_union
+--   2. Mask three columns             D-naive v_row_and_column_naive  D  v_row_and_column
+--   3. Low-cardinality column         E-naive v_name_naive         E  v_name_dedup
+--   4. Row-level only (fewer rows)    -- no counterpart --         C  v_ssn_rowfilter
+--   5. Point lookup by plaintext      F-naive v_lookup_naive       F  v_lookup_by_token
 --
 -- Scenario 4 is not result-equivalent to the others: it removes rows rather
 -- than masking a column, so it is an alternative to scenario 1, not a faster
 -- way to get the same answer.
+
 
 -- ---------------------------------------------------------------------------
 -- Entitlement lookup table
@@ -55,8 +57,12 @@ SELECT *, MOD(id, 4) AS branch_id
 FROM `${PROJECT}.${DATASET}.pii_tokenized`;
 
 
+-- ===========================================================================
+-- SCENARIO 1 -- mask one column, all rows returned
+-- ===========================================================================
+
 -- ---------------------------------------------------------------------------
--- SCENARIO 1, NAIVE -- pattern A: conditional detokenization (column masking)
+-- 1 NAIVE -- pattern A: conditional detokenization
 -- ---------------------------------------------------------------------------
 -- Returns every row; masks ssn where not entitled. Semantically what you want.
 -- Performance: catastrophic. The remote function sits inside a CASE, so
@@ -74,11 +80,10 @@ FROM `${PROJECT}.${DATASET}.v_tokenized_branched` t
 LEFT JOIN `${PROJECT}.${DATASET}.entitlements` e
   ON e.user_email = SESSION_USER() AND e.branch_id = t.branch_id;
 
-
 -- ---------------------------------------------------------------------------
--- SCENARIO 1, FIX -- pattern B: UNION ALL of two unconditional branches
+-- 1 FIX -- pattern B: UNION ALL of two unconditional branches
 -- ---------------------------------------------------------------------------
--- Result-equivalent to Pattern A (same rows, same masking), but no conditional
+-- Result-equivalent to pattern A (same rows, same masking), but no conditional
 -- wraps the remote function. Each branch applies it unconditionally to its own
 -- row set, so batching survives.
 CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_ssn_union` AS
@@ -104,27 +109,38 @@ LEFT JOIN `${PROJECT}.${DATASET}.entitlements` e
 WHERE e.branch_id IS NULL;
 
 
+-- ===========================================================================
+-- SCENARIO 2 -- mask three independently-governed columns
+-- ===========================================================================
+
 -- ---------------------------------------------------------------------------
--- SCENARIO 4 -- pattern C: row filter (different semantics -- fewer rows)
+-- 2 NAIVE -- pattern D-naive: one CASE per governed column
 -- ---------------------------------------------------------------------------
--- Entitlement becomes a JOIN predicate; non-entitled rows disappear entirely
--- rather than being masked. Fastest of the three because the function only
--- ever sees rows the user may read. Use when row-level filtering is the
--- required semantics; it is NOT a drop-in replacement for A.
-CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_ssn_rowfilter` AS
+-- The obvious extension of pattern A to several columns, and the obvious
+-- disaster: three short-circuiting expressions, so three chances to drop to
+-- one request per row.
+--
+-- Defined here only so the anti-pattern is reproducible and the file covers
+-- every scenario in the doc. Do not build on it.
+CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_row_and_column_naive` AS
 SELECT
   t.id,
   t.branch_id,
-  `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.ssn, 'ssn') AS ssn
+  CASE WHEN e.can_see_ssn
+       THEN `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.ssn, 'ssn')
+       ELSE '***-**-****' END AS ssn,
+  CASE WHEN e.can_see_email
+       THEN `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.email, 'email')
+       ELSE '***@***' END AS email,
+  CASE WHEN e.can_see_name
+       THEN `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.name, 'name')
+       ELSE '***' END AS name
 FROM `${PROJECT}.${DATASET}.v_tokenized_branched` t
 JOIN `${PROJECT}.${DATASET}.entitlements` e
-  ON e.user_email = SESSION_USER()
- AND e.branch_id = t.branch_id
- AND e.can_see_ssn;
-
+  ON e.user_email = SESSION_USER() AND e.branch_id = t.branch_id;
 
 -- ---------------------------------------------------------------------------
--- SCENARIO 2, FIX -- pattern D: row AND column control, linear in columns
+-- 2 FIX -- pattern D: row AND column control, linear in columns
 -- ---------------------------------------------------------------------------
 -- Pattern B works, but a UNION ALL per masked column means 2^N branches for N
 -- independently-governed columns. Three columns is already eight branches, each
@@ -139,12 +155,6 @@ JOIN `${PROJECT}.${DATASET}.entitlements` e
 -- Column-level control is the WHERE inside each per-column CTE. A user without
 -- a column grant makes that CTE scan zero rows, so the function is never called
 -- for it at all.
---
--- The naive counterpart (SCENARIO 2, NAIVE -- "D-naive": three nested CASE
--- expressions, one per governed column) is deliberately NOT defined here. It
--- exists only as a benchmark control and is built inline by
--- fpe/scripts/sweep.py, in probe_access_control under the key
--- "D_naive_case_3col". Creating it as a view would invite someone to use it.
 CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_row_and_column` AS
 WITH visible AS (
   -- ROW level: the entitlement join. Everything downstream sees only these.
@@ -191,8 +201,25 @@ LEFT JOIN email_dec m USING (id)
 LEFT JOIN name_dec  n USING (id);
 
 
+-- ===========================================================================
+-- SCENARIO 3 -- low-cardinality column
+-- ===========================================================================
+
 -- ---------------------------------------------------------------------------
--- SCENARIO 3, FIX -- pattern E: decode DISTINCT tokens, then join back
+-- 3 NAIVE -- pattern E-naive: decode every row
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_name_naive` AS
+SELECT
+  t.id,
+  `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.name, 'name') AS name
+FROM `${PROJECT}.${DATASET}.v_tokenized_branched` t
+JOIN `${PROJECT}.${DATASET}.entitlements` e
+  ON e.user_email = SESSION_USER()
+ AND e.branch_id  = t.branch_id
+ AND e.can_see_name;
+
+-- ---------------------------------------------------------------------------
+-- 3 FIX -- pattern E: decode DISTINCT tokens, then join back
 -- ---------------------------------------------------------------------------
 -- Determinism means equal plaintext always yields equal ciphertext, so a column
 -- with C distinct values across R rows only needs C decryptions, not R. For a
@@ -218,16 +245,93 @@ SELECT v.id, d.clear AS name
 FROM visible v
 JOIN decoded d ON d.tok = v.name;
 
--- SCENARIO 3, NAIVE -- pattern E-naive: decodes every row.
-CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_name_naive` AS
+
+-- ===========================================================================
+-- SCENARIO 4 -- row-level control only (fewer rows, not masked columns)
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- 4 -- pattern C: entitlement as a join predicate
+-- ---------------------------------------------------------------------------
+-- Non-entitled rows disappear entirely rather than being masked. Fast, because
+-- the function only ever sees rows the user may read. Use when row-level
+-- filtering is the required semantics; it is NOT a drop-in replacement for
+-- pattern A, and so has no naive counterpart to beat.
+CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_ssn_rowfilter` AS
 SELECT
   t.id,
-  `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.name, 'name') AS name
+  t.branch_id,
+  `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.ssn, 'ssn') AS ssn
 FROM `${PROJECT}.${DATASET}.v_tokenized_branched` t
 JOIN `${PROJECT}.${DATASET}.entitlements` e
   ON e.user_email = SESSION_USER()
- AND e.branch_id  = t.branch_id
- AND e.can_see_name;
+ AND e.branch_id = t.branch_id
+ AND e.can_see_ssn;
+
+
+-- ===========================================================================
+-- SCENARIO 5 -- point lookup by plaintext, through an authorized view
+--
+-- Combines section 5 (search by tokenizing the term) with section 6 (access
+-- control). This is the shape most real user-facing traffic takes: "show me
+-- this one person's record, if I am allowed to see it".
+--
+-- The tension: an authorized view must detokenize to be useful, but a lookup
+-- must filter before detokenizing or it decrypts the whole table. Resolving it
+-- needs one idea -- the view exposes the TOKEN alongside the decrypted value,
+-- so callers can filter on ciphertext. Section 4 established that BigQuery
+-- pushes simple WHERE predicates through a remote function, so a predicate on
+-- the token column is applied before the decryption in the projection.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- 5 NAIVE -- pattern F-naive: filter on the decrypted output
+-- ---------------------------------------------------------------------------
+-- The intuitive query against pattern C's view. The predicate references the
+-- view's decrypted column, so every entitled row must be decrypted before the
+-- comparison can happen.
+--
+--   SELECT * FROM v_lookup_naive WHERE ssn = '123-45-6789';
+--
+CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_lookup_naive` AS
+SELECT
+  t.id,
+  t.branch_id,
+  `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.ssn, 'ssn') AS ssn
+FROM `${PROJECT}.${DATASET}.v_tokenized_branched` t
+JOIN `${PROJECT}.${DATASET}.entitlements` e
+  ON e.user_email = SESSION_USER()
+ AND e.branch_id = t.branch_id
+ AND e.can_see_ssn;
+
+-- ---------------------------------------------------------------------------
+-- 5 FIX -- pattern F: expose the token so callers can filter on ciphertext
+-- ---------------------------------------------------------------------------
+-- Identical to F-naive except it also projects the raw token as `ssn_token`.
+-- That single extra column is what lets a caller search without decrypting:
+--
+--   DECLARE tok STRING;
+--   SET tok = (SELECT `${PROJECT}.${DATASET}`.fpe_encrypt('123-45-6789','ssn'));
+--   SELECT * FROM v_lookup_by_token WHERE ssn_token = tok;
+--
+-- One remote call to tokenize the term, entitlement still enforced by the join,
+-- and only the matching row is decrypted.
+--
+-- Exposing the token is safe in the sense that ciphertext is not plaintext, but
+-- it is not free: under deterministic tokenization a token is a stable
+-- pseudonymous identifier that permits correlation. Expose it only where the
+-- caller is already trusted with the row.
+CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_lookup_by_token` AS
+SELECT
+  t.id,
+  t.branch_id,
+  t.ssn AS ssn_token,
+  `${PROJECT}.${DATASET}`.fpe_decrypt_b5000(t.ssn, 'ssn') AS ssn
+FROM `${PROJECT}.${DATASET}.v_tokenized_branched` t
+JOIN `${PROJECT}.${DATASET}.entitlements` e
+  ON e.user_email = SESSION_USER()
+ AND e.branch_id = t.branch_id
+ AND e.can_see_ssn;
 
 
 -- ---------------------------------------------------------------------------
@@ -241,3 +345,6 @@ JOIN `${PROJECT}.${DATASET}.entitlements` e
 -- 3. Every query through these views counts against the per-project limit of
 --    10 concurrent queries containing remote functions. Scope the detokenizing
 --    views to a small entitled population and request a quota increase early.
+-- 4. A lookup whose token the caller already holds contains no remote function
+--    at all, so it does not count against that limit -- see scenario 5 and
+--    docs/performance-tuning.md section 5.

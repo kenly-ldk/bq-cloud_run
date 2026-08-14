@@ -651,20 +651,11 @@ def probe_access_control(client, ctx: dict) -> list[dict]:
             f"FROM (SELECT ssn, email, name FROM {ds}.v_row_and_column "
             f"WHERE id <= {n})"
         ),
-        # D as it would naively be written: nested CASE per column.
+        # D as it would naively be written: one CASE per governed column.
         "D_naive_case_3col": (
             f"SELECT SUM(LENGTH(ssn)) + SUM(LENGTH(email)) + SUM(LENGTH(name)) "
-            f"FROM (SELECT "
-            f"  CASE WHEN e.can_see_ssn THEN {ds}.fpe_decrypt_b5000(t.ssn,'ssn') "
-            f"       ELSE '***-**-****' END AS ssn, "
-            f"  CASE WHEN e.can_see_email THEN {ds}.fpe_decrypt_b5000(t.email,'email') "
-            f"       ELSE '***@***' END AS email, "
-            f"  CASE WHEN e.can_see_name THEN {ds}.fpe_decrypt_b5000(t.name,'name') "
-            f"       ELSE '***' END AS name "
-            f"FROM {ds}.v_tokenized_branched t "
-            f"JOIN {ds}.entitlements e "
-            f"  ON e.user_email = SESSION_USER() AND e.branch_id = t.branch_id "
-            f"WHERE t.id <= {n})"
+            f"FROM (SELECT ssn, email, name FROM {ds}.v_row_and_column_naive "
+            f"WHERE id <= {n})"
         ),
     }
 
@@ -690,6 +681,60 @@ def probe_access_control(client, ctx: dict) -> list[dict]:
               f"{stats.get('elapsed_s', 0):>8.2f}s  "
               f"http_requests={logs.get('log_batches', 0):<7} "
               f"rows/req={logs.get('batch_rows_median', 0)}")
+        if err:
+            print(f"      {err[:200]}")
+
+    # Scenario 5: point lookup by plaintext, through an authorized view.
+    # Combines the search pattern with access control -- the shape most
+    # user-facing traffic takes. Needs a real plaintext/token pair.
+    pair = list(client.query(
+        f"SELECT c.ssn AS clear, t.ssn AS token "
+        f"FROM `{ctx['project']}.{ctx['dataset']}.{ctx['clear_table']}` c "
+        f"JOIN `{ctx['project']}.{ctx['dataset']}.{ctx['table']}` t USING (id) "
+        f"WHERE MOD(c.id, 4) IN (0, 1) LIMIT 1"     # entitled branch
+    ).result())[0]
+
+    lookups = {
+        # Filter on the view's decrypted output: every entitled row must be
+        # decrypted before the comparison can be made.
+        "F_naive_filter_on_plaintext": (
+            f"SELECT COUNT(*) FROM {ds}.v_lookup_naive "
+            f"WHERE ssn = '{pair['clear']}'"
+        ),
+        # Tokenize the term once, filter on ciphertext. The token predicate is
+        # pushed below the decryption, so only the matching row is decrypted.
+        "F_filter_on_token": (
+            f"DECLARE tok STRING;\n"
+            f"SET tok = (SELECT {ds}.fpe_encrypt(''||'{pair['clear']}', 'ssn'));\n"
+            f"SELECT COUNT(*) FROM {ds}.v_lookup_by_token WHERE ssn_token = tok;"
+        ),
+        # Caller already holds the token: no remote function in the query at
+        # all, so it does not count against the 10-concurrent-query limit.
+        "F_caller_supplies_token": (
+            f"SELECT COUNT(*) FROM {ds}.v_lookup_by_token "
+            f"WHERE ssn_token = '{pair['token']}'"
+        ),
+    }
+    for name, sql in lookups.items():
+        t_start = datetime.now(timezone.utc) - timedelta(seconds=2)
+        try:
+            stats = run_query(client, sql)
+            ok, err = True, None
+        except Exception as exc:  # noqa: BLE001
+            stats, ok, err = {}, False, str(exc)[:300]
+        t_end = datetime.now(timezone.utc) + timedelta(seconds=2)
+        time.sleep(LOG_SETTLE_S)
+        logs = summarise_logs(fetch_logs(ctx["project"], ctx["service"],
+                                         t_start, t_end)) if ok else {}
+        records.append({
+            "phase": "access_control", "config": LIMIT_DEPLOYMENT.label,
+            "probe": "access_control", "variant": name,
+            "rows": ctx["rows"], "succeeded": ok, "error": err, **stats, **logs,
+        })
+        print(f"    {name:<27} {'OK' if ok else 'FAILED':<7} "
+              f"{stats.get('elapsed_s', 0):>7.2f}s  "
+              f"rows_to_service={logs.get('log_rows_total', 0):>9,}  "
+              f"http_requests={logs.get('log_batches', 0)}")
         if err:
             print(f"      {err[:200]}")
 
@@ -733,21 +778,8 @@ def probe_access_control(client, ctx: dict) -> list[dict]:
         "D_vs_naive_case": (
             f"WITH d AS (SELECT id, ssn, email, name FROM {ds}.v_row_and_column "
             f"           WHERE id <= {n}), "
-            f"     c AS (SELECT t.id, "
-            f"             CASE WHEN e.can_see_ssn THEN "
-            f"               {ds}.fpe_decrypt_b5000(t.ssn,'ssn') "
-            f"               ELSE '***-**-****' END AS ssn, "
-            f"             CASE WHEN e.can_see_email THEN "
-            f"               {ds}.fpe_decrypt_b5000(t.email,'email') "
-            f"               ELSE '***@***' END AS email, "
-            f"             CASE WHEN e.can_see_name THEN "
-            f"               {ds}.fpe_decrypt_b5000(t.name,'name') "
-            f"               ELSE '***' END AS name "
-            f"           FROM {ds}.v_tokenized_branched t "
-            f"           JOIN {ds}.entitlements e "
-            f"             ON e.user_email = SESSION_USER() "
-            f"            AND e.branch_id = t.branch_id "
-            f"           WHERE t.id <= {n}) "
+            f"     c AS (SELECT id, ssn, email, name "
+            f"           FROM {ds}.v_row_and_column_naive WHERE id <= {n}) "
             f"SELECT COUNTIF(d.ssn IS DISTINCT FROM c.ssn "
             f"            OR d.email IS DISTINCT FROM c.email "
             f"            OR d.name IS DISTINCT FROM c.name) AS mismatches, "
