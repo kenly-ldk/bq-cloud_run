@@ -438,15 +438,41 @@ SET tok = (SELECT `proj.ds`.fpe_encrypt('123-45-6789', 'ssn'));
 SELECT COUNT(*) FROM pii_tokenized WHERE ssn = tok;
 ```
 
-**3. `precomputed_token` — the floor** ([`sweep.py:584`](../fpe/scripts/sweep.py#L584))
+**3. `precomputed_token` — caller already holds the token** ([`sweep.py:584`](../fpe/scripts/sweep.py#L584))
 
-The same scan with the token already known and inlined as a literal, so no
-remote function is involved at all. Included to show how much of shape 2's time
-is the scan itself rather than the round trip.
+The same scan with the token supplied as a literal, so no remote function is
+involved at all.
 
 ```sql
 SELECT COUNT(*) FROM pii_tokenized WHERE ssn = '<literal token>'
 ```
+
+This is both the measurement floor — it isolates how much of shape 2 is the scan
+rather than the round trip — and a realistic pattern in its own right:
+
+- **The token is already the identifier.** When data arrives pre-tokenized from
+  an upstream PEP and that system hands downstream consumers the token rather
+  than the plaintext, every lookup is naturally token-based and BigQuery never
+  tokenizes anything.
+- **Application-side caching.** Resolve a subject once, keep the token, and
+  every subsequent query — dashboard refresh, drill-down, pagination — is a
+  literal comparison. You pay tokenization once per subject, not once per query.
+- **BI tools that cannot script.** Shape 2 requires a `DECLARE`/`SET`
+  multi-statement script, which most dashboarding layers cannot emit. They can
+  usually pass a token as a filter parameter, making shape 3 the only fast path
+  actually available.
+- **It escapes the concurrency limit.** The per-project cap in §2 counts
+  *queries containing remote functions*. Shape 2 contains one; shape 3 contains
+  none, so it does not count at all. For a high-concurrency interactive
+  workload that is the difference between contending for 10 slots and having no
+  remote-function ceiling.
+
+The trade-off: the caller must hold the token, so either it has key access or a
+trusted system supplied it. Distributing tokens is normally fine — but under
+deterministic tokenization a token is a stable pseudonymous identifier that
+permits correlation across datasets and over time, so treat "non-sensitive" as
+a threat-model decision rather than an assumption. Cached tokens also go stale
+across key rotation.
 
 | Approach | Elapsed | HTTP requests | Rows through function |
 | --- | --- | --- | --- |
@@ -668,7 +694,9 @@ Ordered by the size of the effect measured here.
 2. **Decode distinct values, not rows**, for low-cardinality columns (7,900x
    fewer rows through the service on a 63-distinct-value column).
 3. **Search by tokenizing the term**, bound via `DECLARE`/`SET` (~9x, and
-   960,000 → 1 row through the function).
+   960,000 → 1 row through the function). Better still, have the caller supply
+   an already-known token: that query contains no remote function at all, so it
+   escapes the 10-concurrent-query limit entirely.
 4. **Scale horizontally.** `maxScale` 1→8 gave 3.2x; it beats vCPU per unit of
    effort and avoids worker oversubscription.
 5. **Set gunicorn workers = vCPU** for CPU-bound work; `containerConcurrency` a
