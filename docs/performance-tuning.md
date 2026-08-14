@@ -385,26 +385,30 @@ SELECT SUM(LENGTH(fpe_decrypt_b5000(ssn,'ssn')))
 FROM (SELECT id, ssn FROM pii_tokenized LIMIT 400000) WHERE MOD(id,1000)=0
 ```
 
-| Shape | Elapsed | Rows sent to service | HTTP requests |
-| --- | --- | --- | --- |
-| `limit_AFTER_detok` | 4.63s | 150,000 | 30 |
-| `limit_BEFORE_detok` | **0.97s** | **100** | 1 |
-| `aggregate_AFTER_detok` | 7.56s | 400,000 | 80 |
-| `aggregate_BEFORE_detok` | **0.34s** | **0** | **0** |
-| `filter_AFTER_detok` | 0.55s | 397 | 1 |
-| `filter_BEFORE_detok` | 0.57s | 397 | 1 |
+| Pair | Shape | Elapsed | Rows sent to service | HTTP requests |
+| --- | --- | --- | --- | --- |
+| 1 — `LIMIT` | `limit_AFTER_detok` | 4.63s | 150,000 | 30 |
+| 1 — `LIMIT` | `limit_BEFORE_detok` | **0.97s** | **100** | 1 |
+| 2 — aggregation | `aggregate_AFTER_detok` | 7.56s | 400,000 | 80 |
+| 2 — aggregation | `aggregate_BEFORE_detok` | **0.34s** | **0** | **0** |
+| 3 — `WHERE` | `filter_AFTER_detok` | 0.55s | 397 | 1 |
+| 3 — `WHERE` | `filter_BEFORE_detok` | 0.57s | 397 | 1 |
 
 Three different behaviours, and the differences matter:
 
-- **`WHERE` placement is irrelevant** — BigQuery pushes simple predicates
-  through the remote function by itself. No need to contort the SQL.
-- **`LIMIT` is only partially pushed** — 150,000 rows crossed the wire to
-  return 100. Put the `LIMIT` in a subquery below the function.
-- **Aggregation is not pushed at all.** And `COUNT(DISTINCT token)` equals
+- **Pair 1 — `LIMIT` is only partially pushed.** 150,000 rows crossed the wire
+  to return 100. BigQuery stopped early rather than decrypting all 400,000, but
+  still did 1,500x more work than needed. Put the `LIMIT` in a subquery below
+  the function.
+- **Pair 2 — aggregation is not pushed at all.** All 400,000 rows were
+  decrypted to produce a single number. And `COUNT(DISTINCT token)` equals
   `COUNT(DISTINCT plaintext)` because tokenization is deterministic and
-  injective — so the correct answer needs **zero** decryptions. Analytics over
+  injective, so the correct answer needs **zero** decryptions. Analytics over
   tokenized columns (counts, group-bys, joins, distincts) should generally not
   touch the remote function at all.
+- **Pair 3 — `WHERE` placement is irrelevant.** Both shapes sent the same 397
+  rows in one request: BigQuery pushes simple predicates through the remote
+  function by itself. No need to contort the SQL for this case.
 
 ---
 
