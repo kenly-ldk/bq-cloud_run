@@ -18,9 +18,10 @@ results below are only visible from the second.
 
 ## Headline findings
 
-1. **`max_batching_rows` is capped at 11,905 rows.** Ask for 1,000,000 and you
-   get 11,905. Most published batch-size tuning advice for remote functions is
-   therefore measuring nothing above ~12k.
+1. **`max_batching_rows` is capped by a ~256 KiB request-body budget**, not by
+   a row count. Narrow SSN rows cap at 11,905/request; wider email rows at
+   6,025. Ask for 1,000,000 and you get whatever fits in 256 KiB. Cloud Run
+   sizing has no effect on it whatsoever.
 2. **Short-circuit evaluation costs ~180x.** A remote function inside `CASE`/`IF`
    drops to one HTTP request *per row*. This is exactly the shape entitlement-driven
    authorized views naturally take.
@@ -54,17 +55,73 @@ the wire.
 | 1,000,000 | **11,905** | 31 | 8.21s |
 | *(omitted — BigQuery chooses)* | **11,905** | 34 | 7.09s |
 
-BigQuery caps a request at **11,905 rows** regardless of what you ask for, and
-its automatic choice is the same number. Anything above ~12,000 is decoration.
+On this column BigQuery caps a request at 11,905 rows regardless of what you
+ask for, and its automatic choice is the same number.
 
-Two consequences:
+### What actually sets the cap
+
+11,905 is not a magic row count. Running `max_batching_rows = 1,000,000`
+against four columns of different widths, across three very different Cloud
+Run shapes:
+
+| Cloud Run config | `ssn` (11 ch) | `dob` (10 ch) | `name` (~11 ch) | `email` (~30 ch) |
+| --- | --- | --- | --- | --- |
+| 1 vCPU, concurrency 1, 1 worker | 11,905 | 10,913 | 11,474 | 6,025 |
+| 4 vCPU, concurrency 8, 4 workers | 11,905 | 10,913 | 11,474 | 6,025 |
+| 8 vCPU, **concurrency 80**, 8 workers | 11,905 | 10,913 | 11,474 | 6,025 |
+
+Two clean results:
+
+- **Cloud Run sizing changes nothing.** Identical caps at 1 vCPU/concurrency 1
+  and 8 vCPU/concurrency 80. That is expected once you see the mechanism:
+  BigQuery decides the batch when it builds the HTTP request, before it has
+  contacted your service, and it has no visibility into `containerConcurrency`
+  at all. Raising instance size or concurrency cannot move this number.
+- **Row width sets it.** Each row is serialised into the `calls` array as
+  `["<value>","<element>"],`. Multiply the cap by those bytes:
+
+  | Column | Cap | Bytes/row on the wire | Cap x bytes |
+  | --- | --- | --- | --- |
+  | `ssn` | 11,905 | 22.0 | 261,910 |
+  | `dob` | 10,913 | 24.0 | 261,912 |
+  | `name` | 11,474 | 22.9 | 262,755 |
+  | `email` | 6,025 | 43.5 | 262,088 |
+
+  Constant at ~262,000 bytes. **256 KiB is 262,144**, leaving ~232 bytes of
+  JSON envelope (`requestId`, `caller`, `sessionUser`, `userDefinedContext`).
+  `dob` matches exactly because it is fixed-width; the variable-width columns
+  scatter by a few hundred bytes, which is just the mean-length estimate.
+
+So the rule is **~256 KiB of request body**, and you can predict your own cap:
+
+```
+rows_per_request ≈ 261,900 / (len(value) + len(data_element) + 6)
+```
+
+Note this is observed behaviour, not documented contract — but it held across
+every configuration tested.
+
+### Not the 5 MB limit
+
+The documented "maximum input size 5 MB" is a *per-row* limit — "the maximum
+total size of all input arguments from a **single row**". It bounds how large
+one row's arguments may be, not how many rows fit in a request. At ~22 bytes
+per row we are six orders of magnitude away from it, and dividing 5 MB by the
+observed cap yields 420–830 bytes/row, which matches nothing on the wire.
+
+### Consequences
 
 - Benchmarks comparing `b50000` against `b100000` are comparing identical
   configurations. This retroactively explains the Protegrity results in
   [`protegrity/README.md`](../protegrity/README.md), where batch sizes from
-  10,000 to 100,000 all produced ~50,000 rows/s: they were all 11,905.
-- The cap protects you from the 15 MB response limit for ordinary row widths.
-  You have to work to exceed it (see §2).
+  10,000 to 100,000 all produced ~50,000 rows/s.
+- **The cap is per HTTP request, not per query or per project.** Each query
+  slices its own rows independently, so N concurrent queries each get full-size
+  batches. Nothing is shared across queries.
+- Wide columns cost you batching efficiency automatically. Passing a long
+  `data_element` name, or extra arguments, directly shrinks your batch.
+- The cap keeps you clear of the 15 MB *response* limit for ordinary row
+  widths — you have to inflate replies deliberately to breach it (see §2).
 
 ---
 
@@ -436,8 +493,9 @@ Ordered by the size of the effect measured here.
    per partition.
 8. **Design for 10 concurrent remote-function queries** even though we couldn't
    reproduce the limit, and request an increase early if you need more.
-9. **Don't tune `max_batching_rows`** above ~1,000. It is capped at 11,905 and
-   throughput is flat well below that.
+9. **Don't tune `max_batching_rows`** above ~1,000. It is capped by a ~256 KiB
+   request-body budget (11,905 rows for narrow columns, 6,025 for email-width),
+   and throughput is flat well below that. Cloud Run sizing cannot raise it.
 
 ## Reproducing
 
@@ -457,5 +515,6 @@ python fpe/scripts/analyze.py fpe/scripts/sweep_raw_*.jsonl
 - Single project, single region, one workload shape (CPU-bound, ~77 µs/row,
   narrow STRING columns). A memory-bound or I/O-bound service would invert the
   worker-model conclusions.
-- The 11,905-row cap was consistent across every configuration tested but is
-  undocumented, so treat it as observed behaviour rather than contract.
+- The ~256 KiB request-body budget was consistent across four column widths
+  and three Cloud Run shapes, but is undocumented — treat it as observed
+  behaviour rather than contract.

@@ -469,6 +469,81 @@ def probe_retries(client, ctx: dict) -> list[dict]:
     return records
 
 
+#: Cloud Run shapes for the batch-cap probe. Deliberately extreme in both
+#: directions, including containerConcurrency at Cloud Run's own default of 80.
+BATCH_CAP_DEPLOYMENTS = [
+    Deployment(label="capsmall", cpu=1, memory="1Gi", concurrency=1, workers=1),
+    Deployment(label="capmid", cpu=4, memory="2Gi", concurrency=8, workers=4),
+    Deployment(label="capbig", cpu=8, memory="4Gi", concurrency=80, workers=8),
+]
+
+#: (column, data element, approximate plaintext width in chars)
+BATCH_CAP_COLUMNS = [
+    ("ssn", "ssn", 11),
+    ("dob", "digits", 10),
+    ("name", "name", 11),
+    ("email", "email", 32),
+]
+
+
+def probe_batch_cap(client, ctx: dict) -> list[dict]:
+    """What actually determines the ~11,905 rows-per-request cap?
+
+    Two candidate explanations:
+      (a) Cloud Run capacity — bigger instance or higher containerConcurrency
+          would raise it. Implausible: BigQuery decides the batch before it
+          contacts Cloud Run, and cannot see containerConcurrency at all.
+      (b) A byte budget on the request payload — then a WIDER column yields a
+          SMALLER row cap, and Cloud Run sizing is irrelevant.
+
+    This varies both axes against a function with max_batching_rows=1,000,000
+    (far above any observed cap) and reads the real batch size off the logs.
+    """
+    records: list[dict] = []
+    ds = f"`{ctx['project']}.{ctx['dataset']}`"
+    tbl = f"`{ctx['project']}.{ctx['dataset']}.{ctx['table']}`"
+
+    for cfg in BATCH_CAP_DEPLOYMENTS:
+        if not ctx.get("skip_deploy"):
+            print(f"    deploying {cfg.label} "
+                  f"(cpu={cfg.cpu} conc={cfg.concurrency} workers={cfg.workers})")
+            deploy(cfg, verbose=False)
+            time.sleep(10)
+
+        for column, element, width in BATCH_CAP_COLUMNS:
+            sql = (f"SELECT SUM(LENGTH({ds}.fpe_decrypt_b1000000"
+                   f"({column}, '{element}'))) "
+                   f"FROM (SELECT {column} FROM {tbl} LIMIT {ctx['rows']})")
+            t_start = datetime.now(timezone.utc) - timedelta(seconds=2)
+            try:
+                stats = run_query(client, sql)
+                ok, err = True, None
+            except Exception as exc:  # noqa: BLE001
+                stats, ok, err = {}, False, str(exc)[:300]
+            t_end = datetime.now(timezone.utc) + timedelta(seconds=2)
+            time.sleep(LOG_SETTLE_S)
+            logs = summarise_logs(fetch_logs(ctx["project"], ctx["service"],
+                                             t_start, t_end)) if ok else {}
+            cap = logs.get("batch_rows_max") or 0
+            rec = {
+                "phase": "batch_cap", "config": cfg.label, "probe": "batch_cap",
+                "cpu": cfg.cpu, "concurrency": cfg.concurrency,
+                "workers": cfg.workers, "column": column,
+                "plaintext_width": width, "succeeded": ok, "error": err,
+                # If the cap is a byte budget, cap * bytes-per-row is constant.
+                "implied_bytes_per_row": (
+                    round(5_000_000 / cap, 1) if cap else None),
+                **stats, **logs,
+            }
+            records.append(rec)
+            print(f"      {cfg.label:<9} {column:<6} (~{width:>2}ch)  "
+                  f"cap={cap:>7,}  median={logs.get('batch_rows_median', 0):>8,}  "
+                  f"requests={logs.get('log_batches', 0):>4}")
+            if err:
+                print(f"        {err[:180]}")
+    return records
+
+
 def probe_search_pattern(client, ctx: dict) -> list[dict]:
     """Search by tokenising the term vs detokenising the column.
 
@@ -783,6 +858,7 @@ PROBES = {
     "search_pattern": probe_search_pattern,
     "access_control": probe_access_control,
     "placement": probe_placement,
+    "batch_cap": probe_batch_cap,
 }
 
 
@@ -1049,6 +1125,7 @@ def main() -> int:
             # probe especially: one HTTP request per row at 500k rows would
             # take hours and prove nothing extra.
             "small_rows": min(args.rows, 20_000),
+            "skip_deploy": args.skip_deploy,
         }
         for name in probe_names:
             print(f"\n=== [{name}] ===")
