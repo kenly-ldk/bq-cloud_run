@@ -505,18 +505,33 @@ table. Detokenization happens through the remote function only for entitled data
 
 The natural way to write it is the slowest possible way.
 
-| Pattern | What it is | Semantics | Elapsed | HTTP requests | Rows/request |
-| --- | --- | --- | --- | --- | --- |
-| **A** [`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L52) | entitlement in a `CASE` arm | all rows, masked column | 29.44s | 975 | 1 |
-| **B** [`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L71) | `UNION ALL` of entitled + masked branches | *identical to A* | **1.40s** | 1 | 987 |
-| **C** [`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L101) | entitlement as a join predicate | fewer rows | 1.37s | 1 | 987 |
-| **D** [`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L129) | per-column CTE + `LEFT JOIN` back | all rows, 3 masked columns | **1.67s** | 74 | 24 |
-| **D-naive** | three nested `CASE` expressions | *identical to D* | 52.47s | 1,953 | 1 |
-| **E** [`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L185) | decode `DISTINCT` tokens, join back | *identical to E-naive* | **2.05s** | **1** | **63** |
-| **E-naive** [`v_name_naive`](../fpe/sql/access_control_patterns.sql#L203) | decode every row | — | 12.73s | 101 | 500,409 rows total |
+Grouped by scenario, naive shape first in each:
 
-Equivalence is asserted by the benchmark, not claimed in prose — A vs B, D vs
-D-naive, and E vs E-naive all returned **0 mismatches**.
+| Scenario | Pattern | What it is | Elapsed | Speed-up | HTTP requests | Rows to service |
+| --- | --- | --- | --- | --- | --- | --- |
+| **1.** Mask one column<br>*(all rows returned)* | **A** — naive<br>[`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L52) | entitlement inside a `CASE` arm | 29.44s | — | 975 | 975 |
+| | **B** — fix<br>[`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L71) | `UNION ALL` of two unconditional branches | **1.40s** | **21x** | **1** | 987 |
+| **2.** Mask three columns<br>*(all rows returned)* | **D-naive** — naive | three nested `CASE` expressions | 52.47s | — | 1,953 | 1,953 |
+| | **D** — fix<br>[`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L129) | per-column CTE + `LEFT JOIN` back | **1.67s** | **31x** | 74 | 1,816 |
+| **3.** Low-cardinality column<br>*(all entitled rows)* | **E-naive** — naive<br>[`v_name_naive`](../fpe/sql/access_control_patterns.sql#L203) | decode every row | 12.73s | — | 101 | 500,409 |
+| | **E** — fix<br>[`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L185) | decode `DISTINCT` tokens, join back | **2.05s** | **6.2x** | **1** | **63** |
+| **4.** Row-level only<br>*(fewer rows returned)* | **C**<br>[`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L101) | entitlement as a join predicate | 1.37s | n/a | 1 | 987 |
+
+Within each scenario the two shapes return **identical results** — the benchmark
+asserts it rather than claiming it, and A vs B, D vs D-naive and E vs E-naive
+all returned **0 mismatches**. Scenario 4 is listed separately because it is
+*not* result-equivalent to the others: it filters rows away instead of masking a
+column, so it has no naive counterpart to beat.
+
+Do not compare elapsed times *across* scenarios. Scenarios 1, 2 and 4 run over a
+~1,950-row slice; scenario 3 runs over the full entitled half of the 1M-row
+table. Only the within-scenario ratios are meaningful.
+
+> **Provenance note.** Pattern E's `1 request / 63 rows` comes from a follow-up
+> measurement, not from `sweep_raw_patterns.jsonl`, which records `0` for both.
+> The original run's log window closed before Cloud Logging ingested the single
+> small request. The harness now waits `LOG_SETTLE_S = 20` for exactly this
+> reason; a zero in a raw record means "not observed", never "did not happen".
 
 ### A vs B — they are not the same query
 
