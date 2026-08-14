@@ -207,38 +207,145 @@ headroom than the number "10" suggests.
 ## 3. The batching cliff
 
 BigQuery disables batching when a remote function sits inside a short-circuiting
-expression — the docs say `calls` then "has exactly one element". Measured over
-20,000 rows:
+expression — the docs say `calls` then "has exactly one element".
+
+All four shapes below do the same conceptual work: decrypt `ssn` for the half of
+the rows where `MOD(id, 2) = 0`. They differ only in *where the conditional
+sits* relative to the function call. Source:
+[`sweep.py:365`](../fpe/scripts/sweep.py#L365).
+
+**1. `plain` — unconditional baseline** ([`sweep.py:380`](../fpe/scripts/sweep.py#L380))
+
+No conditional at all. Establishes what full batching looks like, and is the
+control the other three are measured against.
+
+```sql
+SELECT SUM(LENGTH(fpe_decrypt_b5000(ssn, 'ssn')))
+FROM (SELECT id, ssn FROM pii_tokenized LIMIT 20000)
+```
+
+**2. `inside_case` — the anti-pattern** ([`sweep.py:382`](../fpe/scripts/sweep.py#L382))
+
+The function is an arm of a `CASE`. This is the shape an entitlement-driven
+authorized view naturally takes, and the one to avoid.
+
+```sql
+SELECT SUM(LENGTH(
+  CASE WHEN MOD(id, 2) = 0 THEN fpe_decrypt_b5000(ssn, 'ssn')
+       ELSE ssn END))
+FROM (SELECT id, ssn FROM pii_tokenized LIMIT 20000)
+```
+
+**3. `hoisted_subquery` — the fix that isn't** ([`sweep.py:390`](../fpe/scripts/sweep.py#L390))
+
+Computes the decryption unconditionally in an inner `SELECT`, then chooses in
+the outer one. The reasoning is sound and the result is wrong — see below.
+
+```sql
+SELECT SUM(LENGTH(IF(MOD(id, 2) = 0, dec, ssn)))
+FROM (SELECT id, ssn, fpe_decrypt_b5000(ssn, 'ssn') AS dec
+      FROM (SELECT id, ssn FROM pii_tokenized LIMIT 20000))
+```
+
+**4. `filter_then_apply` — the fix that works** ([`sweep.py:397`](../fpe/scripts/sweep.py#L397))
+
+The condition becomes a `WHERE` predicate, so no conditional expression wraps
+the call. Note this evaluates *half* the rows, like shape 2 — it is doing the
+same amount of cryptographic work, just batched.
+
+```sql
+SELECT SUM(LENGTH(fpe_decrypt_b5000(ssn, 'ssn')))
+FROM (SELECT id, ssn FROM pii_tokenized LIMIT 20000)
+WHERE MOD(id, 2) = 0
+```
+
+### Results — 20,000 rows
 
 | Query shape | Elapsed | HTTP requests | Rows/request |
 | --- | --- | --- | --- |
-| unconditional | **1.59s** | 4 | 5,000 |
-| inside `CASE` | 240.32s | 9,963 | **1** |
-| hoisted into subquery | 256.61s | 9,963 | **1** |
-| filter first, then apply | **1.36s** | 2 | 4,982 |
+| 1. `plain` — unconditional | **1.59s** | 4 | 5,000 |
+| 2. `inside_case` — inside `CASE` | 240.32s | 9,963 | **1** |
+| 3. `hoisted_subquery` — hoisted into subquery | 256.61s | 9,963 | **1** |
+| 4. `filter_then_apply` — filter first | **1.36s** | 2 | 4,982 |
 
-**~180x.** And note row 3: hoisting the call into a subquery so it is computed
-unconditionally *looks* like the fix and is not — the optimizer inlines the
-trivial subquery back into the conditional and short-circuits again. That
-variant is kept in the benchmark precisely because it is such a plausible trap.
+**~180x** between shapes 2 and 4, for identical output.
 
-What works is removing the conditional entirely: filter to the rows you need,
-then apply the function unconditionally to all of them.
+The 9,963 HTTP requests in shapes 2 and 3 are ~half of 20,000 — confirming that
+only the entitled rows were evaluated, one row per request. The cost is not
+extra cryptography; it is 9,963 round trips instead of 2.
+
+**Why shape 3 fails.** Hoisting into a subquery *looks* like it forces
+unconditional evaluation, and the numbers are identical to the bug it was meant
+to fix. BigQuery's optimizer inlines the trivial subquery back into the `IF`,
+restoring short-circuit semantics and single-row batches. It is kept in the
+benchmark precisely because it is such a plausible trap — if you "fix" a slow
+view this way and don't re-measure, you will believe you solved it.
+
+The reliable rule: **no conditional expression may wrap the call.** Push the
+condition into a `WHERE` clause or a join predicate (shape 4), or, when you must
+return the unentitled rows too, use `UNION ALL` of unconditional branches
+(§6, pattern B).
 
 ---
 
 ## 4. Where you put the call
 
-Same result, different placement. 400,000 rows.
+Three pairs of queries. Within each pair both members return **exactly the same
+answer**; the only difference is whether the reducing operation (`LIMIT`,
+aggregation, `WHERE`) runs before or after the remote function. Source:
+[`sweep.py:782`](../fpe/scripts/sweep.py#L782). 400,000 rows.
+
+Naming: `AFTER_detok` means the reduction happens *after* detokenization, so the
+function sees every row — the wasteful ordering. `BEFORE_detok` reduces first.
+
+**Pair 1 — `LIMIT`** ([`sweep.py:795`](../fpe/scripts/sweep.py#L795)). Return 100
+decrypted SSNs.
+
+```sql
+-- limit_AFTER_detok: decrypt everything, then take 100
+SELECT ssn FROM (SELECT fpe_decrypt_b5000(ssn,'ssn') AS ssn
+                 FROM (SELECT ssn FROM pii_tokenized LIMIT 400000)) LIMIT 100
+
+-- limit_BEFORE_detok: take 100, then decrypt those
+SELECT fpe_decrypt_b5000(ssn,'ssn') AS ssn
+FROM (SELECT ssn FROM pii_tokenized LIMIT 100)
+```
+
+**Pair 2 — aggregation** ([`sweep.py:806`](../fpe/scripts/sweep.py#L806)). Count
+distinct SSNs. Equivalent because tokenization is deterministic and injective:
+distinct tokens map one-to-one onto distinct plaintexts.
+
+```sql
+-- aggregate_AFTER_detok: decrypt every row, then count distinct
+SELECT COUNT(DISTINCT fpe_decrypt_b5000(ssn,'ssn'))
+FROM (SELECT ssn FROM pii_tokenized LIMIT 400000)
+
+-- aggregate_BEFORE_detok: count distinct tokens; no decryption needed at all
+SELECT COUNT(DISTINCT ssn) FROM (SELECT ssn FROM pii_tokenized LIMIT 400000)
+```
+
+**Pair 3 — `WHERE`** ([`sweep.py:814`](../fpe/scripts/sweep.py#L814)). Decrypt
+only rows matching a non-sensitive predicate (`MOD(id,1000)=0`, ~400 rows).
+
+```sql
+-- filter_AFTER_detok: filter written outside the projection
+SELECT SUM(LENGTH(ssn)) FROM (
+  SELECT fpe_decrypt_b5000(ssn,'ssn') AS ssn, id
+  FROM (SELECT id, ssn FROM pii_tokenized LIMIT 400000)) WHERE MOD(id,1000)=0
+
+-- filter_BEFORE_detok: filter written below the function
+SELECT SUM(LENGTH(fpe_decrypt_b5000(ssn,'ssn')))
+FROM (SELECT id, ssn FROM pii_tokenized LIMIT 400000) WHERE MOD(id,1000)=0
+```
 
 | Shape | Elapsed | Rows sent to service | HTTP requests |
 | --- | --- | --- | --- |
-| `LIMIT 100` after detokenize | 4.63s | 150,000 | 30 |
-| `LIMIT 100` before detokenize | **0.97s** | **100** | 1 |
-| `COUNT(DISTINCT)` after detokenize | 7.56s | 400,000 | 80 |
-| `COUNT(DISTINCT)` before detokenize | **0.34s** | **0** | **0** |
-| `WHERE` after detokenize | 0.55s | 397 | 1 |
-| `WHERE` before detokenize | 0.57s | 397 | 1 |
+| `limit_AFTER_detok` | 4.63s | 150,000 | 30 |
+| `limit_BEFORE_detok` | **0.97s** | **100** | 1 |
+| `aggregate_AFTER_detok` | 7.56s | 400,000 | 80 |
+| `aggregate_BEFORE_detok` | **0.34s** | **0** | **0** |
+| `filter_AFTER_detok` | 0.55s | 397 | 1 |
+| `filter_BEFORE_detok` | 0.57s | 397 | 1 |
 
 Three different behaviours, and the differences matter:
 
@@ -257,23 +364,52 @@ Three different behaviours, and the differences matter:
 ## 5. Search: tokenize the term, don't detokenize the column
 
 FPE is deterministic, so finding a known plaintext never requires decrypting
-the table. 1M-row table:
+the table. All three shapes below find the same row in a 1M-row table. Source:
+[`sweep.py:547`](../fpe/scripts/sweep.py#L547).
 
-| Approach | Elapsed | HTTP requests | Rows through function |
-| --- | --- | --- | --- |
-| `WHERE fpe_decrypt(ssn) = '<plaintext>'` | 20.72s | 192 | 960,000 |
-| `WHERE ssn = <token>` (token computed once) | **2.38s** | **1** | **1** |
-| `WHERE ssn = '<literal token>'` (no UDF) | 0.77s | 0 | 0 |
+**1. `detokenize_column` — the anti-pattern** ([`sweep.py:569`](../fpe/scripts/sweep.py#L569))
 
-Bind the token with `DECLARE`/`SET` rather than inlining the call in `WHERE`:
-BigQuery treats remote functions as non-deterministic and does not guarantee
-constant-folding, so an inline call risks per-row evaluation.
+Decrypt every stored value, compare each against the plaintext you want. The
+predicate is opaque to the planner, so it cannot prune anything.
+
+```sql
+SELECT COUNT(*) FROM pii_tokenized
+WHERE fpe_decrypt_b5000(ssn, 'ssn') = '123-45-6789'
+```
+
+**2. `tokenize_term` — the pattern** ([`sweep.py:577`](../fpe/scripts/sweep.py#L577))
+
+Encrypt the one search term, compare against stored ciphertext natively.
 
 ```sql
 DECLARE tok STRING;
 SET tok = (SELECT `proj.ds`.fpe_encrypt('123-45-6789', 'ssn'));
-SELECT * FROM pii_tokenized WHERE ssn = tok;
+SELECT COUNT(*) FROM pii_tokenized WHERE ssn = tok;
 ```
+
+**3. `precomputed_token` — the floor** ([`sweep.py:584`](../fpe/scripts/sweep.py#L584))
+
+The same scan with the token already known and inlined as a literal, so no
+remote function is involved at all. Included to show how much of shape 2's time
+is the scan itself rather than the round trip.
+
+```sql
+SELECT COUNT(*) FROM pii_tokenized WHERE ssn = '<literal token>'
+```
+
+| Approach | Elapsed | HTTP requests | Rows through function |
+| --- | --- | --- | --- |
+| 1. `detokenize_column` | 20.72s | 192 | 960,000 |
+| 2. `tokenize_term` | **2.38s** | **1** | **1** |
+| 3. `precomputed_token` (no UDF) | 0.77s | 0 | 0 |
+
+Shape 3 shows the scan alone costs 0.77s, so the single remote call in shape 2
+adds ~1.6s — most of which is the extra scripting statement, not the transit.
+
+Bind the token with `DECLARE`/`SET` rather than inlining the call in `WHERE`:
+BigQuery treats remote functions as non-deterministic and does not guarantee
+constant-folding, so an inline call risks per-row evaluation — which would
+collapse shape 2 back into shape 1.
 
 **Constraints.** Equality and `IN` only — FPE is not order-preserving, so
 ranges, `LIKE`, and plaintext ordering are impossible on ciphertext. It requires
@@ -292,15 +428,15 @@ table. Detokenization happens through the remote function only for entitled data
 
 The natural way to write it is the slowest possible way.
 
-| Pattern | Semantics | Elapsed | HTTP requests | Rows/request |
-| --- | --- | --- | --- | --- |
-| **A** `CASE` masking, 1 column | all rows, masked column | 29.44s | 975 | 1 |
-| **B** `UNION ALL` masking, 1 column | *identical to A* | **1.40s** | 1 | 987 |
-| **C** row filter only | fewer rows | 1.37s | 1 | 987 |
-| **D** row + column, 3 columns | all rows, 3 masked columns | **1.67s** | 74 | 24 |
-| **D-naive** nested `CASE`, 3 columns | *identical to D* | 52.47s | 1,953 | 1 |
-| **E** dedup decode (low-cardinality) | *identical to E-naive* | **2.05s** | **1** | **63** |
-| **E-naive** decode every row | — | 12.73s | 101 | 500,409 rows total |
+| Pattern | What it is | Semantics | Elapsed | HTTP requests | Rows/request |
+| --- | --- | --- | --- | --- | --- |
+| **A** [`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L52) | entitlement in a `CASE` arm | all rows, masked column | 29.44s | 975 | 1 |
+| **B** [`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L71) | `UNION ALL` of entitled + masked branches | *identical to A* | **1.40s** | 1 | 987 |
+| **C** [`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L101) | entitlement as a join predicate | fewer rows | 1.37s | 1 | 987 |
+| **D** [`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L129) | per-column CTE + `LEFT JOIN` back | all rows, 3 masked columns | **1.67s** | 74 | 24 |
+| **D-naive** | three nested `CASE` expressions | *identical to D* | 52.47s | 1,953 | 1 |
+| **E** [`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L185) | decode `DISTINCT` tokens, join back | *identical to E-naive* | **2.05s** | **1** | **63** |
+| **E-naive** [`v_name_naive`](../fpe/sql/access_control_patterns.sql#L203) | decode every row | — | 12.73s | 101 | 500,409 rows total |
 
 Equivalence is asserted by the benchmark, not claimed in prose — A vs B, D vs
 D-naive, and E vs E-naive all returned **0 mismatches**.
