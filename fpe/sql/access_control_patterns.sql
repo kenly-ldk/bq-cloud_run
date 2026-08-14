@@ -16,13 +16,26 @@
 --   (CASE/IF, MERGE ... WHEN MATCHED): "the calls field has exactly one
 --   element". One HTTP round trip per row.
 --   https://docs.cloud.google.com/bigquery/docs/remote-functions#limitations
+--
+-- Measured results for every pattern below are in docs/performance-tuning.md
+-- section 6, which groups them into scenarios. This file uses the same labels:
+--
+--   Scenario                          Naive                  Fix
+--   -------------------------------   --------------------   --------------------
+--   1. Mask one column                A  v_ssn_case          B  v_ssn_union
+--   2. Mask three columns             D-naive (see below)    D  v_row_and_column
+--   3. Low-cardinality column         E-naive v_name_naive   E  v_name_dedup
+--   4. Row-level only (fewer rows)    -- no counterpart --   C  v_ssn_rowfilter
+--
+-- Scenario 4 is not result-equivalent to the others: it removes rows rather
+-- than masking a column, so it is an alternative to scenario 1, not a faster
+-- way to get the same answer.
 
 -- ---------------------------------------------------------------------------
 -- Entitlement lookup table
 -- ---------------------------------------------------------------------------
--- Grants the current user rows in branches 0 and 1 (of 0..3), i.e. 50% of the
--- table, with SSN visibility. Real deployments key this off a group, not a
--- single user_email.
+-- Real deployments key this off a group, not a single user_email.
+--
 -- ROW-level grant: which branches the user may see rows from.
 -- COLUMN-level grant: which columns they may see in clear within those rows.
 -- Here: branches 0 and 1 of 0..3 (50% of rows); ssn and name in clear, email
@@ -43,7 +56,7 @@ FROM `${PROJECT}.${DATASET}.pii_tokenized`;
 
 
 -- ---------------------------------------------------------------------------
--- PATTERN A -- ANTI-PATTERN: conditional detokenization (column masking)
+-- SCENARIO 1, NAIVE -- pattern A: conditional detokenization (column masking)
 -- ---------------------------------------------------------------------------
 -- Returns every row; masks ssn where not entitled. Semantically what you want.
 -- Performance: catastrophic. The remote function sits inside a CASE, so
@@ -63,7 +76,7 @@ LEFT JOIN `${PROJECT}.${DATASET}.entitlements` e
 
 
 -- ---------------------------------------------------------------------------
--- PATTERN B -- FIX: UNION ALL of two unconditional branches
+-- SCENARIO 1, FIX -- pattern B: UNION ALL of two unconditional branches
 -- ---------------------------------------------------------------------------
 -- Result-equivalent to Pattern A (same rows, same masking), but no conditional
 -- wraps the remote function. Each branch applies it unconditionally to its own
@@ -92,7 +105,7 @@ WHERE e.branch_id IS NULL;
 
 
 -- ---------------------------------------------------------------------------
--- PATTERN C -- FIX: row filter (different semantics -- fewer rows)
+-- SCENARIO 4 -- pattern C: row filter (different semantics -- fewer rows)
 -- ---------------------------------------------------------------------------
 -- Entitlement becomes a JOIN predicate; non-entitled rows disappear entirely
 -- rather than being masked. Fastest of the three because the function only
@@ -111,7 +124,7 @@ JOIN `${PROJECT}.${DATASET}.entitlements` e
 
 
 -- ---------------------------------------------------------------------------
--- PATTERN D -- ROW *and* COLUMN level control, scaling linearly in columns
+-- SCENARIO 2, FIX -- pattern D: row AND column control, linear in columns
 -- ---------------------------------------------------------------------------
 -- Pattern B works, but a UNION ALL per masked column means 2^N branches for N
 -- independently-governed columns. Three columns is already eight branches, each
@@ -126,6 +139,12 @@ JOIN `${PROJECT}.${DATASET}.entitlements` e
 -- Column-level control is the WHERE inside each per-column CTE. A user without
 -- a column grant makes that CTE scan zero rows, so the function is never called
 -- for it at all.
+--
+-- The naive counterpart (SCENARIO 2, NAIVE -- "D-naive": three nested CASE
+-- expressions, one per governed column) is deliberately NOT defined here. It
+-- exists only as a benchmark control and is built inline by
+-- fpe/scripts/sweep.py, in probe_access_control under the key
+-- "D_naive_case_3col". Creating it as a view would invite someone to use it.
 CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_row_and_column` AS
 WITH visible AS (
   -- ROW level: the entitlement join. Everything downstream sees only these.
@@ -173,7 +192,7 @@ LEFT JOIN name_dec  n USING (id);
 
 
 -- ---------------------------------------------------------------------------
--- PATTERN E -- decode DISTINCT tokens, then join back
+-- SCENARIO 3, FIX -- pattern E: decode DISTINCT tokens, then join back
 -- ---------------------------------------------------------------------------
 -- Determinism means equal plaintext always yields equal ciphertext, so a column
 -- with C distinct values across R rows only needs C decryptions, not R. For a
@@ -199,7 +218,7 @@ SELECT v.id, d.clear AS name
 FROM visible v
 JOIN decoded d ON d.tok = v.name;
 
--- Naive counterpart, for contrast: decodes every row.
+-- SCENARIO 3, NAIVE -- pattern E-naive: decodes every row.
 CREATE OR REPLACE VIEW `${PROJECT}.${DATASET}.v_name_naive` AS
 SELECT
   t.id,

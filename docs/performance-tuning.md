@@ -509,13 +509,13 @@ Grouped by scenario, naive shape first in each:
 
 | Scenario | Pattern | What it is | Elapsed | Speed-up | HTTP requests | Rows to service |
 | --- | --- | --- | --- | --- | --- | --- |
-| **1.** Mask one column<br>*(all rows returned)* | **A** — naive<br>[`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L52) | entitlement inside a `CASE` arm | 29.44s | — | 975 | 975 |
-| | **B** — fix<br>[`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L71) | `UNION ALL` of two unconditional branches | **1.40s** | **21x** | **1** | 987 |
-| **2.** Mask three columns<br>*(all rows returned)* | **D-naive** — naive | three nested `CASE` expressions | 52.47s | — | 1,953 | 1,953 |
-| | **D** — fix<br>[`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L129) | per-column CTE + `LEFT JOIN` back | **1.67s** | **31x** | 74 | 1,816 |
-| **3.** Low-cardinality column<br>*(all entitled rows)* | **E-naive** — naive<br>[`v_name_naive`](../fpe/sql/access_control_patterns.sql#L203) | decode every row | 12.73s | — | 101 | 500,409 |
-| | **E** — fix<br>[`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L185) | decode `DISTINCT` tokens, join back | **2.05s** | **6.2x** | **1** | **63** |
-| **4.** Row-level only<br>*(fewer rows returned)* | **C**<br>[`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L101) | entitlement as a join predicate | 1.37s | n/a | 1 | 987 |
+| **1.** Mask one column<br>*(all rows returned)* | **A** — naive<br>[`v_ssn_case`](../fpe/sql/access_control_patterns.sql#L65) | entitlement inside a `CASE` arm | 29.44s | — | 975 | 975 |
+| | **B** — fix<br>[`v_ssn_union`](../fpe/sql/access_control_patterns.sql#L84) | `UNION ALL` of two unconditional branches | **1.40s** | **21x** | **1** | 987 |
+| **2.** Mask three columns<br>*(all rows returned)* | **D-naive** — naive<br>[`sweep.py`](../fpe/scripts/sweep.py#L655) | three nested `CASE` expressions | 52.47s | — | 1,953 | 1,953 |
+| | **D** — fix<br>[`v_row_and_column`](../fpe/sql/access_control_patterns.sql#L148) | per-column CTE + `LEFT JOIN` back | **1.67s** | **31x** | 74 | 1,816 |
+| **3.** Low-cardinality column<br>*(all entitled rows)* | **E-naive** — naive<br>[`v_name_naive`](../fpe/sql/access_control_patterns.sql#L222) | decode every row | 12.73s | — | 101 | 500,409 |
+| | **E** — fix<br>[`v_name_dedup`](../fpe/sql/access_control_patterns.sql#L204) | decode `DISTINCT` tokens, join back | **2.05s** | **6.2x** | **1** | **63** |
+| **4.** Row-level only<br>*(fewer rows returned)* | **C**<br>[`v_ssn_rowfilter`](../fpe/sql/access_control_patterns.sql#L114) | entitlement as a join predicate | 1.37s | n/a | 1 | 987 |
 
 Within each scenario the two shapes return **identical results** — the benchmark
 asserts it rather than claiming it, and A vs B, D vs D-naive and E vs E-naive
