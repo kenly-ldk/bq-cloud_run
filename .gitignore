@@ -1,8 +1,19 @@
-# Benchmark Results
+# Per-workstation config — never commit
+config/shared.env.local
+
+# Benchmark results from the Protegrity scripts (ad-hoc, not curated)
 benchmark_results.json
 benchmark_single_batch_results.json
+pii_data.csv
 
-# Python environment (if any)
+# Generated SQL — contains real project IDs and endpoint URLs.
+# Regenerate with: python fpe/scripts/generate_remote_functions.py
+fpe/sql/generated_*.sql
+
+# NOTE: fpe/scripts/sweep_raw_*.jsonl are deliberately NOT ignored — they are
+# the evidence behind docs/performance-tuning.md and docs/results/.
+
+# Python environment
 __pycache__/
 *.py[cod]
 *$py.class

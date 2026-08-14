@@ -30,10 +30,13 @@ def run_query(bq_client, query, description):
     }
 
 def main():
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "kenly-demo-1")
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project_id:
+        print("Error: set GOOGLE_CLOUD_PROJECT (or source config/prelude.sh).")
+        raise SystemExit(1)
     dataset_id = os.environ.get("BIGQUERY_DATASET", "pii_transform_demo")
     table_id = os.environ.get("BIGQUERY_TABLE", "pii_table_tokenized")
-    
+
     print(f"Using Project: {project_id}, Dataset: {dataset_id}, Table: {table_id}")
     
     bq_client = bigquery.Client(project=project_id)

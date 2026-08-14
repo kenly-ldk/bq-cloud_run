@@ -1,0 +1,64 @@
+# Knative service manifest, rendered by fpe/scripts/deploy.sh via envsubst.
+#
+# Every value that the tuning study varies is a shell-style placeholder here, so
+# one sweep step is: render -> `gcloud run services replace` -> run BQ queries.
+#
+# The knobs, and why each one is in the matrix:
+#   FPE_CONCURRENCY   containerConcurrency — requests admitted per instance at
+#                     once. An admission limit, NOT a parallelism guarantee.
+#   FPE_CPU           vCPU per instance. Caps real parallelism for CPU-bound work.
+#   FPE_WORKERS       gunicorn processes. This is what actually buys parallelism
+#                     in CPython; must be paired with FPE_CPU to pay off.
+#   FPE_THREADS       gunicorn threads/worker. Helps only GIL-releasing work.
+#   FPE_CPU_THROTTLING  "false" = CPU always allocated, "true" = CPU only during
+#                     request processing (cheaper, but background/GC work stalls).
+#   FPE_CPU_BOOST     extra CPU during startup — changes cold-start, not steady state.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: ${FPE_SERVICE}
+  labels:
+    demo: fpe-perf
+spec:
+  template:
+    metadata:
+      name: ${FPE_SERVICE}-${REVISION_SUFFIX}
+      annotations:
+        autoscaling.knative.dev/minScale: "${FPE_MIN_INSTANCES}"
+        autoscaling.knative.dev/maxScale: "${FPE_MAX_INSTANCES}"
+        run.googleapis.com/execution-environment: ${FPE_EXECUTION_ENV}
+        run.googleapis.com/startup-cpu-boost: "${FPE_CPU_BOOST}"
+        run.googleapis.com/cpu-throttling: "${FPE_CPU_THROTTLING}"
+    spec:
+      containerConcurrency: ${FPE_CONCURRENCY}
+      timeoutSeconds: ${FPE_REQUEST_TIMEOUT}
+      containers:
+        - image: ${FPE_IMAGE}
+          name: app
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "${FPE_CPU}"
+              memory: ${FPE_MEMORY}
+          env:
+            - name: FPE_KEY
+              value: "${FPE_KEY}"
+            - name: FPE_TWEAK
+              value: "${FPE_TWEAK}"
+            - name: FPE_WORKERS
+              value: "${FPE_WORKERS}"
+            - name: FPE_THREADS
+              value: "${FPE_THREADS}"
+            - name: FPE_WORKER_CLASS
+              value: "${FPE_WORKER_CLASS}"
+            - name: FPE_LOG_REQUESTS
+              value: "${FPE_LOG_REQUESTS}"
+            - name: REVISION_TAG
+              value: "${REVISION_SUFFIX}"
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            failureThreshold: 10
+            periodSeconds: 3
