@@ -13,6 +13,9 @@ fpe/sql/generated_*.sql
 # NOTE: fpe/scripts/sweep_raw_*.jsonl are deliberately NOT ignored — they are
 # the evidence behind docs/performance-tuning.md and docs/results/.
 
+# Scratch — screenshots, drafts, anything not meant to be evidence
+tmp/
+
 # Python environment
 __pycache__/
 *.py[cod]
