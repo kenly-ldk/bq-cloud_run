@@ -154,11 +154,26 @@ two arguments.
 
 We kept two arguments, and the reasoning generalises: one function serves every
 data element, versus N functions to regenerate whenever a new column is
-governed. §7 shows throughput is flat above ~1,000 rows/request, so a 37% larger
-batch buys nothing measurable for a workload spending 118 µs/row inside the
-service. Argument width is worth optimising only when you are per-request-bound
-rather than compute-bound — the `noop`/`hmac` end of §7's decomposition, or an
-endpoint billed per invocation.
+governed. The performance case for dropping the argument is also weaker than the
++37% suggests, because **fewer arguments makes each request bigger, not
+cheaper.** The total FF3-1 is fixed by the row count; all you save is the
+per-request fixed cost, times the requests you eliminated.
+
+Fitting that fixed cost out of §7's batch-size table — 100 rows/request at
+21,401 rows/s against 2,500 at 32,093, over 4 workers — gives **~6.5 ms per
+request**, against 118 µs/row of compute. So on a 1M-row `ssn` query the
+one-argument form issues 62 requests instead of 84 and saves ~143 ms out of
+~118 s of work: **0.12%**. The break-even is where per-row work equals the
+amortised fixed cost, `6,458 µs ÷ 16,368 rows ≈ 0.4 µs/row`. Against §7's
+workload decomposition `fpe_decrypt` sits 300x above that line and spends 0.3%
+of each request on overhead, `hmac` (7 µs/row) spends 5%, and only a
+`noop`-class function spends enough for argument width to matter. Optimise it
+when you are per-request-bound rather than compute-bound, or when the endpoint
+bills per invocation.
+
+(That 6.5 ms is fitted from two points in a table the Caveats section warns is
+noisy — an order of magnitude, not a constant. It would have to be wrong by 100x
+to change the conclusion.)
 
 One constraint if you are tempted to fold arguments together: remote functions
 do not support `ARRAY`, `STRUCT`, `INTERVAL` or `GEOGRAPHY`, so you cannot pass
