@@ -824,6 +824,116 @@ per-request penalty, and 500 is an outlier consistent with the variance noted
 above. Combined with the 11,905 cap from §1: **batch size is close to a
 non-knob** above ~1,000. Tune workers and instances instead.
 
+### Worked example: sizing 300 concurrent 1M-row queries
+
+Everything above is a measurement of one configuration at a time. This applies
+those constants to a concrete ask — **300 concurrent queries, 1,000,000 rows
+each, 10-byte values, through a one-argument function.** It is *derived from*
+the tables above, not separately measured; treat the arithmetic as planning
+guidance, not as a result.
+
+**Requests.** One argument means 5 bytes of JSON punctuation per row (§1), so
+15 bytes on the wire:
+
+```
+261,900 / (10 + 5) = 17,460 rows/request
+1,000,000 / 17,460 ≈ 58 requests per query  →  ~17,400 requests in total
+```
+
+The two-argument form of the same function, with a 3-character data element,
+costs 21 bytes/row → 12,471 rows/request → 81 requests per query, ~24,300 in
+total. Dropping the argument removes **28% of the HTTP requests** — which, per
+the batch-size table above, is worth approximately nothing here, because each
+request is 2.06 s of FF3-1 either way (17,460 rows × 118 µs) and per-request
+overhead is invisible against that.
+
+**Concurrent requests — not 17,400.** Requests issued and requests in flight are
+different numbers. §2's solo 1M-row query ran at 54,202 rows/s with 1.40 s of
+service time per request, which by Little's law is ~6 requests in flight. So 300
+such queries offer roughly **1,800 concurrent requests**, and at
+`containerConcurrency 8` that needs ~225 instances to absorb without queueing.
+Read ~6 as a floor: that query was already service-limited, so a faster backend
+would draw more.
+
+**Capacity.** 300 × 1M = 300,000,000 rows of FF3-1. The horizontal-scaling table
+above gives ~21,000 rows/s for a single 4-vCPU instance and ~12,000–13,600
+rows/s for each instance beyond the first (scaling efficiency ~60%):
+
+| `maxInstances` (4 vCPU each) | Aggregate rows/s | Wall clock, all 300 queries |
+| --- | --- | --- |
+| 4 | 48,957 *(measured)* | ~1h 42m |
+| 8 | 67,898 *(measured)* | ~1h 14m |
+| 100 (Cloud Run default) | ~1.3M *(extrapolated)* | ~4 min |
+| 250 | ~3.3M *(extrapolated)* | ~1.5 min |
+
+Those wall-clock figures assume the work simply queues, and it does: BigQuery
+holds ~6 requests in flight per query and issues the next only when one returns,
+so all 300 queries make proportional progress and finish together rather than
+some finishing early. The cost lands on per-request latency instead. At
+`maxInstances` 4 the service completes 48,957 / 17,460 ≈ 2.8 requests/s, so
+1,800 in flight means **~640 s per HTTP request**; at `maxInstances` 8, ~460 s.
+
+Both sit under the service's 900 s Cloud Run request timeout
+([`service.yaml.template:34`](../fpe/service/service.yaml.template#L34)) — but
+with no margin, and that clock includes time queued waiting for an instance, not
+just handler time. So the mean request survives and the tail does not. The
+likelier failure is Cloud Run shedding queued requests as 429 before the timeout
+is reached, at which point BigQuery's retry behaviour (§2: 99 invocations for 5
+partitions) amplifies the load rather than shedding it.
+
+Matching the solo latency of a single 1M-row query (18.4 s, §2) across all 300
+would take ~15M rows/s — about 1,150 instances and 4,600 vCPU, well past a
+default regional quota.
+
+Do not read that as 46 vCPU across 100 instances. Cloud Run caps an instance at
+8 vCPU, and the vertical table above shows CPU does not scale linearly anyway —
+per-vCPU throughput *falls* from 10,104 rows/s at 1 vCPU to 3,890 at 8. One
+hundred 8-vCPU instances is ~1.7M rows/s — against ~1.3M for a hundred 4-vCPU
+instances in the table above, so doubling per-instance CPU bought 1.3x, not 2x.
+That is ~3 minutes for the 300M rows, still 9x short of the target. Reaching 15M
+rows/s with 8-vCPU instances would take ~880 of them and ~7,000 vCPU — more
+total CPU than the 4-vCPU shape needs for the same work.
+
+**What actually binds, in order.** BigQuery's 10-concurrent-remote-function-query
+limit (§2) — 300 is 30x that, so this whole exercise presumes a quota increase.
+Then the regional Cloud Run vCPU quota, which caps `maxInstances` at
+`quota ÷ 4 vCPU`. Then, and only then, anything in the tables above. Note also
+that overload here surfaces as latency rather than rejection until Cloud Run's
+queue depth trips 429s — at which point BigQuery's retry behaviour (§2: 99
+invocations for 5 partitions) amplifies the load rather than shedding it.
+
+**What this does not change.** None of §7's tuning conclusions move: still
+`workers = vCPU`, still no threads for CPU-bound work, still horizontal before
+vertical. The scenario changes the sizing arithmetic, not the shape of the
+service.
+
+**And check whether you need any of it.** 300 concurrent queries is an ordinary
+interactive workload. 300 concurrent queries each pushing 1,000,000 rows through
+the remote function is the shape §3–§6 exist to eliminate, and the arithmetic
+above is what it costs to brute-force past them. Before provisioning thousands
+of vCPU:
+
+- **Is a conditional wrapping the call?** Then it isn't 58 requests per query,
+  it's ~1,000,000 — one per row (§3). Fix that before sizing anything.
+- **Is the query aggregating?** `COUNT(DISTINCT token)` equals
+  `COUNT(DISTINCT plaintext)` under deterministic tokenization: 400,000 rows
+  became **zero** invocations (§4). Analytics over tokenized columns should not
+  reach the function at all.
+- **Is it a point lookup?** Tokenize the term instead of detokenizing the
+  column: 1,000,000 rows through the function became **1** (§5, §6 pattern F).
+  That is the shape most user-facing traffic actually takes, and if the caller
+  already holds the token it contains no remote function at all — so it does not
+  count against the concurrency limit either.
+- **Is the column low-cardinality?** Decode `DISTINCT` tokens and join back:
+  500,409 rows became **63** (§6 pattern E).
+- **Is it really returning 1M rows to someone?** Then the `LIMIT` belongs below
+  the function, not above it (§4 pair 1).
+
+A workload that genuinely needs 300,000,000 plaintexts materialised at once — a
+bulk export, a migration, a re-key — is real, and then the sizing above is the
+answer. A dashboard is not that. The cheapest 15M rows/s is the one you never
+have to serve.
+
 ---
 
 ## Does this apply to the Protegrity demo?
