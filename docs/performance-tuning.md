@@ -77,29 +77,92 @@ Two clean results:
   BigQuery decides the batch when it builds the HTTP request, before it has
   contacted your service, and it has no visibility into `containerConcurrency`
   at all. Raising instance size or concurrency cannot move this number.
-- **Row width sets it.** Each row is serialised into the `calls` array as
-  `["<value>","<element>"],`. Multiply the cap by those bytes:
+- **Row width sets it.** Each row is serialised into the `calls` array as one
+  JSON array of that row's argument *values* — for this repo's two-argument
+  functions, `["<value>","<data_element>"],`. `data_element` is the second
+  *argument value*, not the column name: the `dob` column is passed `'digits'`
+  ([`sweep.py:483`](../fpe/scripts/sweep.py#L483)), which is why its row costs
+  24.0 bytes and not 21.0. Column names never cross the wire. Multiply the cap
+  by those bytes:
 
-  | Column | Cap | Bytes/row on the wire | Cap x bytes |
-  | --- | --- | --- | --- |
-  | `ssn` | 11,905 | 22.0 | 261,910 |
-  | `dob` | 10,913 | 24.0 | 261,912 |
-  | `name` | 11,474 | 22.9 | 262,755 |
-  | `email` | 6,025 | 43.5 | 262,088 |
+  | Column | Data element | Cap | Bytes/row on the wire | Cap x bytes |
+  | --- | --- | --- | --- | --- |
+  | `ssn` | `'ssn'` | 11,905 | 11 + 3 + 8 = 22.0 | 261,910 |
+  | `dob` | `'digits'` | 10,913 | 10 + 6 + 8 = 24.0 | 261,912 |
+  | `name` | `'name'` | 11,474 | ~10.9 + 4 + 8 = 22.9 | 262,755 |
+  | `email` | `'email'` | 6,025 | ~30.5 + 5 + 8 = 43.5 | 262,088 |
 
   Constant at ~262,000 bytes. **256 KiB is 262,144**, leaving ~232 bytes of
   JSON envelope (`requestId`, `caller`, `sessionUser`, `userDefinedContext`).
-  `dob` matches exactly because it is fixed-width; the variable-width columns
+  `ssn` and `dob` are fixed-width and land exactly; the variable-width columns
   scatter by a few hundred bytes, which is just the mean-length estimate.
+
+  The 8 bytes are the JSON punctuation around a *two-argument* element —
+  `[`, `"`, `"`, `,`, `"`, `"`, `]`, `,`: two brackets, four quotes, one comma
+  between the arguments, one separating this element from the next. It is not a
+  universal constant. For A quoted string arguments the overhead is `3A + 2` —
+  5 for one argument, 8 for two, 11 for three.
 
 So the rule is **~256 KiB of request body**, and you can predict your own cap:
 
 ```
-rows_per_request ≈ 261,900 / (len(value) + len(data_element) + 6)
+rows_per_request ≈ 261,900 / (sum of argument lengths + 3A + 2)   # A = arg count
 ```
 
-Note this is observed behaviour, not documented contract — but it held across
-every configuration tested.
+That predicts 11,905 / 10,913 / 11,436 / 6,021 for the four columns above,
+against 11,905 / 10,913 / 11,474 / 6,025 measured — within 0.3% on all four.
+(Numeric arguments lose their two quotes; `BYTES` are base64, so ~4/3 of raw
+length.) Note this is observed behaviour, not documented contract — but it held
+across every configuration tested.
+
+### Arity is a design decision, and it costs you batch size
+
+Nothing about remote functions is two-argument. The signature is whatever your
+`CREATE FUNCTION` declares, and that is a three-way contract nothing validates:
+
+1. **The DDL declares the signature.** This repo hardcodes
+   `(val STRING, data_element STRING)` for every generated FPE function
+   ([`generate_remote_functions.py:84`](../fpe/scripts/generate_remote_functions.py#L84))
+   and for the Protegrity functions
+   ([`create_remote_functions.sql`](../protegrity/sql/create_remote_functions.sql)),
+   but `pii_noop(val STRING)` in that same file takes one — 5 bytes of overhead
+   per row, not 8.
+2. **BigQuery serialises exactly those arguments, in declared order, values
+   only.** No names, no types, no schema exchange.
+3. **The service unpacks positionally** — `call[0]`, `call[1]`
+   ([`main.py:218`](../fpe/service/main.py#L218)).
+
+If 1 and 3 disagree you find out at runtime: a surplus declared argument is
+silently ignored, a missing one raises `IndexError`, and Flask surfaces that as
+a 500 — 20 retries per partition (§2).
+
+**Per-row constants do not belong in arguments.** `user_defined_context` is
+fixed at `CREATE FUNCTION` time and sent **once per request** in the envelope,
+so it costs nothing per row. That is already how `mode` is passed here.
+`data_element` could go the same way:
+
+| Design | Per-row wire form | Bytes/row (`ssn`) | Cap | Functions to maintain |
+| --- | --- | --- | --- | --- |
+| Two arguments (this repo) | `["123-45-6789","ssn"],` | 22 | 11,905 | 1, any data element |
+| One argument + context | `["123-45-6789"],` | 16 | **16,368** | one per data element |
+
++37% batch on `ssn`, +22% on `email`, and the service already supports it:
+`default_de` reads `data_element` from the context and the per-row argument is
+optional ([`main.py:209`](../fpe/service/main.py#L209),
+[`main.py:221`](../fpe/service/main.py#L221)). Only the DDL template is fixed at
+two arguments.
+
+We kept two arguments, and the reasoning generalises: one function serves every
+data element, versus N functions to regenerate whenever a new column is
+governed. §7 shows throughput is flat above ~1,000 rows/request, so a 37% larger
+batch buys nothing measurable for a workload spending 118 µs/row inside the
+service. Argument width is worth optimising only when you are per-request-bound
+rather than compute-bound — the `noop`/`hmac` end of §7's decomposition, or an
+endpoint billed per invocation.
+
+One constraint if you are tempted to fold arguments together: remote functions
+do not support `ARRAY`, `STRUCT`, `INTERVAL` or `GEOGRAPHY`, so you cannot pass
+a struct. `JSON` is allowed.
 
 ### Not the 5 MB limit
 
@@ -118,8 +181,8 @@ observed cap yields 420–830 bytes/row, which matches nothing on the wire.
 - **The cap is per HTTP request, not per query or per project.** Each query
   slices its own rows independently, so N concurrent queries each get full-size
   batches. Nothing is shared across queries.
-- Wide columns cost you batching efficiency automatically. Passing a long
-  `data_element` name, or extra arguments, directly shrinks your batch.
+- Wide columns cost you batching efficiency automatically, and so does every
+  extra argument you declare — see the arity trade-off above.
 - The cap keeps you clear of the 15 MB *response* limit for ordinary row
   widths — you have to inflate replies deliberately to breach it (see §2).
 
