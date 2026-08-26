@@ -118,7 +118,21 @@ against 11,905 / 10,913 / 11,474 / 6,025 measured — within 0.3% on all four.
 length.) Note this is observed behaviour, not documented contract — but it held
 across every configuration tested.
 
-### Arity is a design decision, and it costs you batch size
+### How arity, batch size and latency connect
+
+Argument count is a design decision, and it propagates through a chain:
+
+```
+arity + argument lengths
+  -> bytes per row on the wire
+  -> rows per request (batch size), since the ~256 KiB budget is fixed
+  -> number of HTTP requests needed for a given table
+  -> total latency
+```
+
+Every link is real, but **the last one is weak**: total latency is dominated by
+per-row processing, which arity does not change. Quantified at the end of this
+section.
 
 Nothing about remote functions is two-argument. The signature is whatever your
 `CREATE FUNCTION` declares, and that is a three-way contract nothing validates:
@@ -155,12 +169,24 @@ optional ([`main.py:209`](../fpe/service/main.py#L209),
 [`main.py:221`](../fpe/service/main.py#L221)). Only the DDL template is fixed at
 two arguments.
 
-We kept two arguments, and the reasoning generalises: one function serves every
-data element, versus N functions to regenerate whenever a new column is
-governed. The performance case for dropping the argument is also weaker than the
-+37% suggests, because **fewer arguments makes each request bigger, not
-cheaper.** The total FF3-1 is fixed by the row count; all you save is the
-per-request fixed cost, times the requests you eliminated.
+We kept two arguments: one function serves every data element, versus N
+functions to regenerate whenever a new column is governed.
+
+**And the +37% buys far less than it looks like.** Follow the chain to its end.
+Dropping the argument raises batch size from 11,905 to 16,368, which cuts the
+request count for a 1M-row table from 84 to 62 — a 26% reduction in *requests*.
+But the rows, and therefore the FF3-1 work, are unchanged. All you save is the
+per-request fixed cost on the 22 requests you eliminated.
+
+The batch sweep in §7 measures how much that is worth: throughput was flat from
+1,000 rows/request (29,068 rows/s) to 50,000 (28,655 rows/s) — indistinguishable
+across a 50x range. The 11,905 → 16,368 move sits entirely inside that flat
+region, so it is worth approximately nothing here.
+
+Arity matters when per-request overhead is a meaningful share of the total —
+tiny result sets, a very cheap per-row transform, or an unusually wide argument
+list. For a workload where per-row processing dominates, choose your signature
+for maintainability and let the batch size fall where it does.
 
 Fitting that fixed cost out of §7's batch-size table — 100 rows/request at
 21,401 rows/s against 2,500 at 32,093, over 4 workers — gives **~6.5 ms per
