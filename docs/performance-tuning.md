@@ -100,13 +100,16 @@ Two clean results:
   The 8 bytes are the JSON punctuation around a *two-argument* element —
   `[`, `"`, `"`, `,`, `"`, `"`, `]`, `,`: two brackets, four quotes, one comma
   between the arguments, one separating this element from the next. It is not a
-  universal constant. For A quoted string arguments the overhead is `3A + 2` —
-  5 for one argument, 8 for two, 11 for three.
+  universal constant. Writing `n_args` for the number of quoted string
+  arguments, the punctuation costs `3 × n_args + 2` bytes: 5 for one argument,
+  8 for two, 11 for three.
 
 So the rule is **~256 KiB of request body**, and you can predict your own cap:
 
 ```
-rows_per_request ≈ 261,900 / (sum of argument lengths + 3A + 2)   # A = arg count
+rows_per_request ≈ 261,900 / (sum of argument lengths + 3 × n_args + 2)
+
+  n_args = number of quoted string arguments the function takes
 ```
 
 That predicts 11,905 / 10,913 / 11,436 / 6,021 for the four columns above,
