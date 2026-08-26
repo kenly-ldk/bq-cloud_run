@@ -821,9 +821,41 @@ is already entitled to the row, which the join above guarantees.
 
 ### `containerConcurrency` vs the worker model — all at 4 vCPU
 
-**`containerConcurrency` is an admission limit, not a parallelism guarantee.**
-It controls how many requests Cloud Run sends to an instance at once. What
-decides how many *execute* simultaneously is the application's worker model.
+First, whose knobs these are — because only one of the four columns below is a
+Cloud Run setting at all:
+
+| Column | Owned by | What it is |
+| --- | --- | --- |
+| `concurrency` | **Cloud Run** | `containerConcurrency`: how many requests the platform will send to one instance at once |
+| `workers` | **gunicorn** | OS *processes* forked inside the container. Each is a separate Python interpreter with its own GIL |
+| `threads` | **gunicorn** | Threads per worker process, sharing that process's GIL |
+| `class` | **gunicorn** | Worker model: `sync` = one request per worker at a time (`threads` ignored); `gthread` = a thread pool per worker |
+
+Cloud Run knows nothing about the last three. It sees a container listening on a
+port; how that container handles concurrent requests is entirely your
+application's business. In this repo they are set in
+[`gunicorn.conf.py`](../fpe/service/gunicorn.conf.py) from the `FPE_WORKERS`,
+`FPE_THREADS` and `FPE_WORKER_CLASS` env vars on the revision, so a sweep can
+change the worker model without rebuilding the image.
+
+The two sides multiply out like this:
+
+```
+Cloud Run admits           up to `concurrency` requests per instance
+The app executes           workers x threads   (gthread)
+                           workers             (sync — threads ignored)
+Anything beyond that       queues in the socket backlog
+```
+
+**So `containerConcurrency` is an admission limit, not a parallelism
+guarantee.** Set it above what the app can execute and the surplus simply waits
+inside the container: latency rises, throughput does not. That is the `c8-w1`
+row below — 8 admitted, 1 executing.
+
+And for CPU-bound pure Python, only `workers` buys parallelism. Threads share a
+GIL, so they interleave rather than run at once; they help only when the work
+*releases* the GIL, as blocking I/O does. Hence `gthread` being the worst row in
+the table despite genuinely holding 6 requests in flight.
 
 | concurrency | workers | threads | class | Rows/s | µs/row (svc) | Peak in-flight |
 | --- | --- | --- | --- | --- | --- | --- |
