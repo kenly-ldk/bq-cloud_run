@@ -103,6 +103,10 @@ RENDERERS = {
                                     ["maxScale"])),
     "modes": lambda r: ("Cost decomposition by workload",
                         render_perf(r, "modes", ["mode"], ["mode"])),
+    "concurrency_only": lambda r: (
+        "containerConcurrency isolated (cpu=4, workers=4, sync, maxScale=1)",
+        render_perf(r, "concurrency_only", ["cfg_concurrency"],
+                    ["containerConcurrency"])),
     "throttling": lambda r: ("CPU throttling",
                              render_perf(r, "throttling", ["cfg_cpu_throttling"],
                                          ["cpu-throttling"])),

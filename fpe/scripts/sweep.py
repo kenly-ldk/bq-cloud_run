@@ -136,6 +136,27 @@ def phase_concurrency() -> list[tuple[Deployment, list[Trial]]]:
     return [(c, trials) for c in configs]
 
 
+def phase_concurrency_only() -> list[tuple[Deployment, list[Trial]]]:
+    """Isolate containerConcurrency with everything else nailed down.
+
+    The `concurrency` phase varies concurrency and workers together, so the two
+    are confounded and it cannot answer "what should containerConcurrency be?".
+    This holds cpu=4, workers=4 (matched to vCPU), sync, maxScale=1 and sweeps
+    only the admission limit.
+
+    maxScale=1 is essential: with autoscaling on, a low containerConcurrency
+    just makes Cloud Run add instances, which measures the autoscaler rather
+    than the setting.
+    """
+    trials = [Trial(mode="fpe_decrypt", batch=5000)]
+    return [
+        (Deployment(label=f"conconly{c}", cpu=4, memory="2Gi", workers=4,
+                    concurrency=c, min_instances=1, max_instances=1), trials)
+        # 80 is Cloud Run's own default, worth knowing where it lands.
+        for c in (1, 2, 4, 6, 8, 12, 16, 32, 80)
+    ]
+
+
 def phase_cpu() -> list[tuple[Deployment, list[Trial]]]:
     """Vertical scaling: does throughput track vCPU when workers match?"""
     trials = [Trial(mode="fpe_decrypt", batch=5000)]
@@ -188,6 +209,7 @@ def phase_throttling() -> list[tuple[Deployment, list[Trial]]]:
 PHASES = {
     "batch": phase_batch,
     "concurrency": phase_concurrency,
+    "concurrency_only": phase_concurrency_only,
     "cpu": phase_cpu,
     "scale": phase_scale,
     "modes": phase_modes,

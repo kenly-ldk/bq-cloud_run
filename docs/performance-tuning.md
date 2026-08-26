@@ -887,6 +887,54 @@ Three things fall out:
 **Set workers = vCPU for CPU-bound work.** Threads only help when the work
 releases the GIL — the `io` mode below, not `fpe_*`.
 
+### So what should `containerConcurrency` be?
+
+The table above cannot answer that: it varies concurrency *and* workers
+together, so the two are confounded. This isolates it — cpu=4, workers=4, sync,
+**maxScale=1** (with autoscaling on, a low concurrency just makes Cloud Run add
+instances, which measures the autoscaler instead of the setting).
+
+| `containerConcurrency` | Median rows/s | Min | Max | Spread across 2 runs |
+| --- | --- | --- | --- | --- |
+| **1** | **9,348** | 9,234 | 9,462 | 1.02x |
+| 2 | 17,357 | 17,100 | 17,615 | 1.03x |
+| 4 | 19,136 | 17,273 | 21,000 | 1.22x |
+| 6 | 23,322 | 21,390 | 25,254 | 1.18x |
+| 8 | 18,975 | 17,940 | 20,010 | 1.12x |
+| 12 | 16,584 | 10,505 | 22,663 | **2.16x** |
+| 16 | 16,500 | 11,092 | 21,908 | **1.98x** |
+| 32 | 17,947 | 16,333 | 19,560 | 1.20x |
+| 80 *(Cloud Run default)* | 22,463 | 18,838 | 26,089 | 1.38x |
+
+**Read the last column before the first.** Two runs of the *same* configuration
+differ by up to 2.16x, while the entire span of medians from concurrency 2 to 80
+is 1.41x. The between-config variation is smaller than the within-config noise,
+so this sweep cannot distinguish 2 from 80, and the apparent peak at 6 is not a
+result — chasing it would be fitting noise.
+
+One thing is clean, because its two runs agree to 1.02x and the gap is 2.5x:
+
+> **`containerConcurrency: 1` starves the workers.** With 4 worker processes and
+> an admission limit of 1, three processes idle permanently. Everything from 2
+> upward is indistinguishable.
+
+So the practical rule is a floor, not an optimum:
+
+```
+containerConcurrency >= workers        # or workers x threads for gthread
+```
+
+Set it at or a little above your worker count so no process starves, and spend
+your tuning effort on `workers` and `maxScale`, which produced 3.7x and 3.2x
+respectively — effects far outside this noise band. Cloud Run's default of 80 is
+fine here; there is no measured reason to lower it, and lowering it below your
+worker count is the one way to make things actively worse.
+
+This also argues for reading the previous table conservatively. The
+worker-model conclusions there rest on gaps of 3x or more (6,882 → 25,728 rows/s,
+82 → 308 µs/row), which survive this noise comfortably. Differences of 20–30%
+between adjacent rows do not.
+
 ### Vertical vs horizontal scaling
 
 | vCPU (workers = vCPU) | Rows/s | | maxScale | Rows/s | Instances observed |
@@ -1122,9 +1170,11 @@ Ordered by the size of the effect measured here.
    10-concurrent-query limit entirely.
 4. **Scale horizontally.** `maxScale` 1→8 gave 3.2x; it beats vCPU per unit of
    effort and avoids worker oversubscription.
-5. **Set gunicorn workers = vCPU** for CPU-bound work; `containerConcurrency` a
-   small multiple of that. Threads buy nothing without I/O — measured 3.3x
-   *worse* per row than processes at the same concurrency.
+5. **Set gunicorn workers = vCPU** for CPU-bound work. Threads buy nothing
+   without I/O — measured 3.3x *worse* per row than processes at the same
+   concurrency. `containerConcurrency` only needs to be **>= workers** so no
+   process starves; above that it made no measurable difference, so leave it at
+   the default rather than tuning it.
 6. **Detokenize after `LIMIT` and after aggregation** (5–22x). Don't bother
    restructuring `WHERE` — BigQuery already pushes it down.
 7. **Return 400, not 500**, for deterministic errors, or pay up to 20 retries
