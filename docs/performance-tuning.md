@@ -358,14 +358,34 @@ headroom than the number "10" suggests.
 
 ---
 
-## 3. The batching cliff
+## Best practices for remote function UDFs
+
+Sections 1 and 2 are how BigQuery behaves: fixed, not yours to change, and worth
+knowing so you stop tuning things that cannot move. The four below are the
+opposite — query shapes you fully control, where the same answer can cost 180x
+more or less depending on how you write the SQL.
+
+| § | Practice | Measured effect |
+| --- | --- | --- |
+| 3 | Never let the call sit inside `CASE`/`IF` | **~180x** |
+| 4 | Reduce (`LIMIT`, aggregate) before you detokenize | **5–22x** |
+| 5 | Search by tokenizing the term, not detokenizing the column | **~9x** |
+| 6 | Shape authorized views so batching survives entitlement logic | **~33x** |
+
+They share one mechanism. A remote function is only fast when BigQuery can send
+many rows per HTTP request, and each of these is a way that property gets
+silently destroyed — by a conditional, by evaluating rows you were going to
+throw away, by filtering on a decrypted column, or by an access-control
+expression. None of them raise an error. The query is simply slow.
+
+### 3. The batching cliff
 
 BigQuery disables batching when a remote function sits inside a short-circuiting
 expression. The documented wording is: *"If evaluation is short-circuited (e.g.
 conditional expressions, `MERGE ... WHEN [NOT] MATCHED`), batching is disabled
 and the `calls` field has exactly one element."*
 
-### What "`calls` has exactly one element" means
+#### What "`calls` has exactly one element" means
 
 `calls` is the JSON array in the request body BigQuery POSTs to your service.
 **Each element of that array is one row's arguments**, so the length of `calls`
@@ -408,7 +428,7 @@ service reads it at [`main.py:206`](../fpe/service/main.py#L206) and logs
 `len(calls)` per request at [`main.py:244`](../fpe/service/main.py#L244). These
 are counted, not inferred from timings.
 
-### The four shapes
+#### The four shapes
 
 All four do the same conceptual work: decrypt `ssn` for the half of the rows
 where `MOD(id, 2) = 0`. They differ only in *where the conditional sits*
@@ -460,7 +480,7 @@ FROM (SELECT id, ssn FROM pii_tokenized LIMIT 20000)
 WHERE MOD(id, 2) = 0
 ```
 
-### Results — 20,000 rows
+#### Results — 20,000 rows
 
 | Query shape | Elapsed | HTTP requests | Rows/request |
 | --- | --- | --- | --- |
@@ -489,7 +509,7 @@ return the unentitled rows too, use `UNION ALL` of unconditional branches
 
 ---
 
-## 4. Where you put the call
+### 4. Where you put the call
 
 Three pairs of queries. Within each pair both members return **exactly the same
 answer**; the only difference is whether the reducing operation (`LIMIT`,
@@ -566,7 +586,7 @@ Three different behaviours, and the differences matter:
 
 ---
 
-## 5. Search: tokenize the term, don't detokenize the column
+### 5. Search: tokenize the term, don't detokenize the column
 
 FPE is deterministic, so finding a known plaintext never requires decrypting
 the table. All three shapes below find the same row in a 1M-row table. Source:
@@ -650,7 +670,7 @@ exactly at write and search time.
 
 ---
 
-## 6. Access control: authorized views + entitlement table
+### 6. Access control: authorized views + entitlement table
 
 The pattern in [`fpe/sql/access_control_patterns.sql`](../fpe/sql/access_control_patterns.sql):
 data arrives already tokenized, BigQuery never holds plaintext at rest, and
@@ -684,7 +704,7 @@ Do not compare elapsed times *across* scenarios. Scenarios 1, 2 and 4 run over a
 ~1,950-row slice; scenario 3 runs over the full entitled half of the 1M-row
 table. Only the within-scenario ratios are meaningful.
 
-### A vs C — masking and filtering are different semantics
+#### A vs C — masking and filtering are different semantics
 
 An important distinction if you're reading this as guidance: **A and C are not
 interchangeable.** `CASE` masking (A) returns every row with the column masked —
@@ -695,7 +715,7 @@ Only **B** is result-equivalent to A: a `UNION ALL` of two unconditional
 branches, one detokenizing the entitled rows, one emitting the mask. That is why
 the table pairs A with B, and lists C on its own as scenario 4.
 
-### D — row *and* column control that scales
+#### D — row *and* column control that scales
 
 `UNION ALL` per masked column means 2^N branches for N independently-governed
 columns. Three columns is eight branches, each rescanning the base table.
@@ -726,7 +746,7 @@ FROM visible v LEFT JOIN ssn_dec s USING (id);
 A user without a column grant makes that CTE scan zero rows, so the function is
 never invoked for it — in the measured run `email` was ungranted and cost nothing.
 
-### E — decode distinct values, not rows
+#### E — decode distinct values, not rows
 
 Determinism means a column with C distinct values across R rows needs C
 decryptions, not R. For `name` (63 distinct tokens in the entitled half of 1M
@@ -734,7 +754,7 @@ rows) that is **63 rows through the service instead of 500,409** — a 7,900x
 reduction, and 14x faster wall-clock. Only worth it when C ≪ R; for near-unique
 columns like `ssn` the `DISTINCT` and join cost more than they save.
 
-### F — point lookup by plaintext, combining §5 and §6
+#### F — point lookup by plaintext, combining §5 and §6
 
 The shape most user-facing traffic actually takes: *"show me this one person's
 record, if I'm allowed to see it."* It needs the search pattern from §5 and the
@@ -783,7 +803,7 @@ but under deterministic tokenization a token is a stable pseudonymous identifier
 that permits correlation across datasets — so project it only where the caller
 is already entitled to the row, which the join above guarantees.
 
-### Hardening
+#### Hardening
 
 - **Put the routines in a dataset users cannot query.** Anyone who can call
   `fpe_decrypt` directly bypasses every view above. Expose only the views.
