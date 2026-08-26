@@ -544,6 +544,64 @@ def probe_batch_cap(client, ctx: dict) -> list[dict]:
     return records
 
 
+def probe_input_size(client, ctx: dict) -> list[dict]:
+    """Where does the ~256 KiB batching budget end and the 5 MiB limit begin?
+
+    These two limits look like they conflict: if BigQuery never sends more than
+    ~256 KiB, the documented 5 MB per-row input limit could never be reached.
+    They don't, because the budget is a batching *target* — BigQuery packs rows
+    until the next would overflow it, but always sends at least one row, however
+    wide.
+
+    Uses `hmac`, whose reply is 16 chars regardless of input size, so the 15 MB
+    *response* ceiling cannot interfere with a probe of the *request* side.
+
+    REPEAT() has its own output cap well under 5 MiB, so wide values are built
+    by concatenating 1 MB chunks.
+    """
+    ds = f"`{ctx['project']}.{ctx['dataset']}`"
+    records: list[dict] = []
+
+    #: (label, SQL expression producing one value, approximate bytes)
+    widths = [
+        ("50 KB", "REPEAT('a', 50000)", 50_000),
+        ("200 KB", "REPEAT('a', 200000)", 200_000),
+        ("300 KB", "REPEAT('a', 300000)", 300_000),
+        ("1 MB", "REPEAT('a', 1000000)", 1_000_000),
+        ("3 MB", "CONCAT(" + ", ".join(["REPEAT('a',1000000)"] * 3) + ")", 3_000_000),
+        ("5 MB", "CONCAT(" + ", ".join(["REPEAT('a',1000000)"] * 5) + ")", 5_000_000),
+        ("6 MB", "CONCAT(" + ", ".join(["REPEAT('a',1000000)"] * 6) + ")", 6_000_000),
+    ]
+
+    for label, expr, nbytes in widths:
+        n_rows = 8 if nbytes <= 1_000_000 else 3
+        sql = (f"SELECT COUNT({ds}.hmac_b1000(v, 'ssn')) "
+               f"FROM (SELECT {expr} AS v FROM UNNEST(GENERATE_ARRAY(1, {n_rows})))")
+        t_start = datetime.now(timezone.utc) - timedelta(seconds=2)
+        try:
+            stats = run_query(client, sql)
+            ok, err = True, None
+        except Exception as exc:  # noqa: BLE001
+            stats, ok, err = {}, False, str(exc)[:300]
+        t_end = datetime.now(timezone.utc) + timedelta(seconds=2)
+        time.sleep(LOG_SETTLE_S)
+        logs = summarise_logs(fetch_logs(ctx["project"], ctx["service"],
+                                         t_start, t_end)) if ok else {}
+        rec = {
+            "phase": "input_size", "config": LIMIT_DEPLOYMENT.label,
+            "probe": "input_size", "variant": label,
+            "bytes_per_row": nbytes, "rows_queried": n_rows,
+            "succeeded": ok, "error": err, **stats, **logs,
+        }
+        records.append(rec)
+        print(f"    {label:>7}/row  {'OK' if ok else 'FAILED':<7} "
+              f"rows_per_request={logs.get('batch_rows_max', '-')}  "
+              f"requests={logs.get('log_batches', '-')}")
+        if err:
+            print(f"      {err[:180]}")
+    return records
+
+
 def probe_search_pattern(client, ctx: dict) -> list[dict]:
     """Search by tokenising the term vs detokenising the column.
 
@@ -891,6 +949,7 @@ PROBES = {
     "access_control": probe_access_control,
     "placement": probe_placement,
     "batch_cap": probe_batch_cap,
+    "input_size": probe_input_size,
 }
 
 

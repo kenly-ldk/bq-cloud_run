@@ -21,7 +21,8 @@ results below are only visible from the second.
 1. **`max_batching_rows` is capped by a ~256 KiB request-body budget**, not by
    a row count. Narrow SSN rows cap at 11,905/request; wider email rows at
    6,025. Ask for 1,000,000 and you get whatever fits in 256 KiB. Cloud Run
-   sizing has no effect on it whatsoever.
+   sizing has no effect on it whatsoever. It is a batching *target*, though —
+   a single row wider than that is still sent, alone, up to a hard 5 MiB.
 2. **Short-circuit evaluation costs ~180x.** A remote function inside `CASE`/`IF`
    drops to one HTTP request *per row*. This is exactly the shape entitlement-driven
    authorized views naturally take.
@@ -208,13 +209,51 @@ One constraint if you are tempted to fold arguments together: remote functions
 do not support `ARRAY`, `STRUCT`, `INTERVAL` or `GEOGRAPHY`, so you cannot pass
 a struct. `JSON` is allowed.
 
-### Not the 5 MB limit
+### Not the 5 MB limit — and why both exist
 
 The documented "maximum input size 5 MB" is a *per-row* limit — "the maximum
-total size of all input arguments from a **single row**". It bounds how large
-one row's arguments may be, not how many rows fit in a request. At ~22 bytes
-per row we are six orders of magnitude away from it, and dividing 5 MB by the
-observed cap yields 420–830 bytes/row, which matches nothing on the wire.
+total size of all input arguments from a **single row**". It is not what
+produces the ~256 KiB budget: dividing 5 MB by the observed caps yields
+420–830 bytes/row, which matches nothing on the wire.
+
+The obvious objection is that if BigQuery never sends more than ~256 KiB, the
+5 MB limit could never be reached and would be dead letter. It isn't, because
+**the 256 KiB budget is a batching target, not a hard cap on request size.**
+BigQuery packs rows until the next one would overflow the budget — but it always
+sends at least one row, even when that row alone exceeds it.
+
+Measured, using `hmac` (whose reply is 16 chars regardless of input, so the
+response ceiling stays out of the way):
+
+| Bytes per row | Rows per request | Result |
+| --- | --- | --- |
+| 50,000 | 6, 2, 1 | OK — several rows fit |
+| 200,000 | 2 | OK |
+| 300,000 | **1** | OK — request exceeds the 256 KiB budget |
+| 1,000,000 | **1** | OK |
+| 5,000,000 | **1** | OK |
+| 6,000,000 | **1** | **FAILED** |
+
+The failure is explicit and gives the real number:
+
+```
+The maximum total size of all input parameters is 5242880 bytes.
+```
+
+**5,242,880 is exactly 5 MiB**, not decimal 5 MB.
+
+So the two limits never compete — they govern different regimes:
+
+| Row width | What binds | Effect |
+| --- | --- | --- |
+| < ~256 KiB | the batching budget | many rows per request; this is the normal case |
+| > ~256 KiB | nothing until 5 MiB | one row per request, request as large as the row |
+| > 5 MiB | the input limit | query fails |
+
+The 5 MiB ceiling is therefore the one that matters for *wide* columns — free
+text, JSON documents, base64 `BYTES` — not for the narrow PII fields this repo
+benchmarks. A Protegrity-style discovery pass over a document column would live
+squarely in that second regime, at one row per request with no batching at all.
 
 ### Consequences
 
@@ -241,7 +280,7 @@ Source: [BigQuery quotas — remote functions](https://docs.cloud.google.com/big
 | HTTP response size (Cloud Run / gen2) | 15 MB | **Confirmed, precisely** |
 | Max HTTP invocation retry attempts | 20 | **Confirmed** (~99 invocations over 5 partitions) |
 | Concurrent queries with remote functions | 10 / project | **Not reproduced** |
-| Max input size (all args, one row) | 5 MB | Not reachable with realistic rows |
+| Max input size (all args, one row) | 5 MB | **Confirmed** — 5 MiB exactly (5,242,880 B); 6 MB fails |
 | HTTP invocation time limit | 20 min | Not reached (our timeout is 900s) |
 
 ### Response size ceiling

@@ -235,6 +235,13 @@ PROBE_RENDERERS = {
         r, "Authorized-view + entitlement patterns", "Pattern"),
     "placement": lambda r: _variant_table(
         r, "Where the remote function sits in the plan", "Shape"),
+    "input_size": lambda r: (
+        "Per-row input size: the 256 KiB batching budget vs the 5 MiB hard limit",
+        table(["Bytes/row", "Result", "Rows per request", "HTTP requests"],
+              [[f"{x['bytes_per_row']:,}", "OK" if x["succeeded"] else "FAILED",
+                _fmt(x.get("batch_rows_max"), ",.0f"),
+                _fmt(x.get("log_batches"), ",.0f")]
+               for x in sorted(r, key=lambda x: x["bytes_per_row"])])),
 }
 
 
