@@ -26,7 +26,7 @@
 | 16 | 8 | 1 | sync | 15.56 | 25,858 | 111 | 1 | 8 | 1 | 5,000 | 2 |
 | 16 | 16 | 1 | sync | 17.78 | 22,501 | 140 | 1 | 16 | 1 | 5,000 | 2 |
 
-### Vertical scaling — vCPU with workers == vCPU
+### Vertical scaling — vCPU, workers set equal to vCPU
 
 | vCPU | workers | Median elapsed (s) | Rows/s | µs/row (svc) | Instances | Worker procs | Peak in-flight | Actual batch rows | n |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -74,3 +74,14 @@
 | 16 | 27.16 | 16,500 | 137 | 1 | 4 | 1 | 5,000 | 2 |
 | 32 | 22.47 | 17,947 | 173 | 1 | 4 | 1 | 5,000 | 2 |
 | 80 | 18.28 | 22,463 | 138 | 1 | 4 | 1 | 5,000 | 2 |
+
+### Worker count isolated (cpu=4, containerConcurrency=80, sync, maxScale=1)
+
+| workers | Median elapsed (s) | Rows/s | µs/row (svc) | Instances | Worker procs | Peak in-flight | Actual batch rows | n |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 37.94 | 10,543 | 86 | 1 | 1 | 1 | 5,000 | 3 |
+| 2 | 31.52 | 12,689 | 153 | 1 | 2 | 1 | 5,000 | 3 |
+| 4 | 14.83 | 26,980 | 131 | 1 | 4 | 1 | 5,000 | 3 |
+| 8 | 16.12 | 24,806 | 272 | 1 | 8 | 1 | 5,000 | 3 |
+| 16 | 11.52 | 34,737 | 328 | 1 | 16 | 1 | 5,000 | 3 |
+| 32 | 13.71 | 29,172 | 795 | 1 | 32 | 1 | 5,000 | 3 |

@@ -95,7 +95,7 @@ RENDERERS = {
                     ["cfg_concurrency", "cfg_workers", "cfg_threads",
                      "cfg_worker_class"],
                     ["containerConcurrency", "workers", "threads", "class"])),
-    "cpu": lambda r: ("Vertical scaling — vCPU with workers == vCPU",
+    "cpu": lambda r: ("Vertical scaling — vCPU, workers set equal to vCPU",
                       render_perf(r, "cpu", ["cfg_cpu", "cfg_workers"],
                                   ["vCPU", "workers"])),
     "scale": lambda r: ("Horizontal scaling — maxScale",
@@ -107,6 +107,9 @@ RENDERERS = {
         "containerConcurrency isolated (cpu=4, workers=4, sync, maxScale=1)",
         render_perf(r, "concurrency_only", ["cfg_concurrency"],
                     ["containerConcurrency"])),
+    "workers_only": lambda r: (
+        "Worker count isolated (cpu=4, containerConcurrency=80, sync, maxScale=1)",
+        render_perf(r, "workers_only", ["cfg_workers"], ["workers"])),
     "throttling": lambda r: ("CPU throttling",
                              render_perf(r, "throttling", ["cfg_cpu_throttling"],
                                          ["cpu-throttling"])),

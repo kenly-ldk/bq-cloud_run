@@ -37,6 +37,13 @@ results below are only visible from the second.
    threads add contention.
 7. **~94% of end-to-end time is compute, not network.** The transit floor is
    403,000 rows/s; FF3-1 runs at 26,000.
+8. **"Workers = vCPU" under-provisioned this service by 1.29x.** 16 gunicorn
+   workers on 4 vCPU beat 4, with non-overlapping run ranges. The rule assumes
+   pure-Python CPU burn; AES-in-C and socket I/O take processes off-core, and
+   extra processes fill the gaps. Measure it rather than applying the rule.
+9. **`containerConcurrency` barely matters above a floor.** Everything from 2 to
+   80 was inside the run-to-run noise. Only `= 1` was clearly bad, by starving
+   workers.
 
 ---
 
@@ -884,8 +891,48 @@ Three things fall out:
 - **Oversubscription costs.** 16 workers on 4 vCPU (22,501) is slower than 8
   (25,858) and 4 (25,728).
 
-**Set workers = vCPU for CPU-bound work.** Threads only help when the work
-releases the GIL — the `io` mode below, not `fpe_*`.
+Threads only help when the work releases the GIL — the `io` mode below, not
+`fpe_*`. How many *processes* to run is measured next, and the textbook answer
+turns out to be wrong.
+
+### So how many workers, then?
+
+The obvious objection to the previous table: if Cloud Run admits 80 requests,
+surely 4 workers is far too few? Standard advice says workers should track vCPU,
+because processes contend for cores. Isolating it — cpu=4, `containerConcurrency`
+80, sync, maxScale=1, 3 runs each — says otherwise:
+
+| workers | vs 4 vCPU | Median rows/s | Range across 3 runs | Spread |
+| --- | --- | --- | --- | --- |
+| 1 | 0.25x | 10,543 | 6,351 – 10,996 | 1.73x |
+| 2 | 0.5x | 12,689 | 11,982 – 14,499 | 1.21x |
+| 4 | **1x** | 26,980 | 22,793 – 26,996 | 1.18x |
+| 8 | 2x | 24,806 | 23,966 – 25,352 | 1.06x |
+| **16** | **4x** | **34,737** | **34,182 – 39,487** | 1.16x |
+| 32 | 8x | 29,172 | 27,980 – 31,107 | 1.11x |
+
+**16 workers on 4 vCPU beat 4 workers by 1.29x, and the ranges do not overlap** —
+22,793–26,996 against 34,182–39,487. Unlike the concurrency sweep, this is
+signal, not noise. Throughput then falls back at 32, so there is a real peak
+around 4x vCPU.
+
+So "workers = vCPU" is wrong here, and the reason is that the work is not the
+pure-Python CPU burn that rule assumes. FF3-1 runs AES through pycryptodome, a C
+extension, and every request also parses JSON, allocates, and reads and writes a
+socket. A process spends real time off-core, and extra processes fill those gaps.
+The rule only holds for work that genuinely occupies a core end to end.
+
+This does not contradict the earlier `c16-w16` row (22,501 rows/s, worse than
+`c16-w8`). That ran at `containerConcurrency` 16, so the admission gate starved
+16 workers. Feed the same 16 workers at concurrency 80 and they reach 34,737.
+The two settings interact exactly as the floor rule predicts: concurrency must be
+at least workers, or the extra processes never see traffic.
+
+**Measure this for your own workload.** The peak sits at 4x vCPU here; for a
+genuinely CPU-only transform it would sit at 1x, and for something I/O-bound
+higher still. What generalises is the method — fix everything else, set
+concurrency high, sweep workers, and check whether the run ranges overlap before
+believing a difference.
 
 ### So what should `containerConcurrency` be?
 
@@ -937,7 +984,7 @@ between adjacent rows do not.
 
 ### Vertical vs horizontal scaling
 
-| vCPU (workers = vCPU) | Rows/s | | maxScale | Rows/s | Instances observed |
+| vCPU (workers set = vCPU) | Rows/s | | maxScale | Rows/s | Instances observed |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 10,104 | | 1 | 21,442 | 1 |
 | 2 | 10,702 | | 2 | 27,058 | 2 |
@@ -945,7 +992,9 @@ between adjacent rows do not.
 | 8 | 31,120 | | 8 | **67,898** | 5 |
 
 Horizontal scaling is the stronger lever: **3.2× from maxScale 1→8**, versus
-3.1× for an 8× increase in vCPU. Adding instances also sidesteps the
+3.1× for an 8× increase in vCPU. Note the vCPU column held workers equal to
+vCPU, which the worker sweep above shows under-provisions this service — so
+those figures are a floor on what each instance size can do, not a ceiling. Adding instances also sidesteps the
 oversubscription ceiling, since each instance gets its own vCPU allocation.
 
 The 2 vCPU point (10,702) is anomalous — statistically indistinguishable from
@@ -1170,11 +1219,13 @@ Ordered by the size of the effect measured here.
    10-concurrent-query limit entirely.
 4. **Scale horizontally.** `maxScale` 1→8 gave 3.2x; it beats vCPU per unit of
    effort and avoids worker oversubscription.
-5. **Set gunicorn workers = vCPU** for CPU-bound work. Threads buy nothing
-   without I/O — measured 3.3x *worse* per row than processes at the same
-   concurrency. `containerConcurrency` only needs to be **>= workers** so no
-   process starves; above that it made no measurable difference, so leave it at
-   the default rather than tuning it.
+5. **Sweep gunicorn workers; do not assume workers = vCPU.** That rule
+   under-provisioned this service by 1.29x — 16 workers on 4 vCPU beat 4, with
+   non-overlapping run ranges, because AES-in-C and socket I/O take processes
+   off-core. Threads are still no substitute: 3.3x *worse* per row than
+   processes. `containerConcurrency` only needs to be **>= workers** so nothing
+   starves; above that it made no measurable difference, so leave it at the
+   default.
 6. **Detokenize after `LIMIT` and after aggregation** (5–22x). Don't bother
    restructuring `WHERE` — BigQuery already pushes it down.
 7. **Return 400, not 500**, for deterministic errors, or pay up to 20 retries

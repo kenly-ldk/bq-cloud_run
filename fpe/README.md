@@ -64,7 +64,10 @@ redeploying the same image:
 | `FPE_CPU_THROTTLING` | `false` = CPU always allocated |
 
 The distinction between `FPE_CONCURRENCY` and `FPE_WORKERS` is the single most
-consequential thing in this repo — see the study.
+consequential thing in this repo — see the study. Short version: concurrency is
+an admission gate that only needs to exceed the worker count, while the worker
+count is the real lever, and its best value was measured at 4x vCPU rather than
+the textbook 1x.
 
 ## Setup
 
@@ -98,6 +101,8 @@ byte-identical results to the naive ones.
 python scripts/sweep.py --list                    # show the plan, deploy nothing
 python scripts/sweep.py --phase batch             # max_batching_rows
 python scripts/sweep.py --phase concurrency       # concurrency x worker model
+python scripts/sweep.py --phase concurrency_only  # containerConcurrency isolated
+python scripts/sweep.py --phase workers_only      # worker count isolated
 python scripts/sweep.py --phase limits            # all documented BQ limits
 python scripts/sweep.py --phase access_control    # authorized-view shapes
 python scripts/analyze.py results/sweep_raw_*.jsonl --out results/tables.md

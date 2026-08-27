@@ -91,8 +91,9 @@ class Trial:
 
 
 # The baseline used by every phase that is not varying infrastructure.
-# 4 vCPU / 4 sync workers: workers == vCPU is the correct pairing for
-# CPU-bound CPython, and is what Phase C exists to demonstrate.
+# 4 vCPU / 4 sync workers. NOTE: this is a reference point, not the optimum --
+# phase `workers_only` measured 16 workers on 4 vCPU as 1.29x faster. Kept as
+# the baseline so earlier phases stay comparable.
 BASELINE = Deployment(label="baseline", cpu=4, memory="2Gi", concurrency=8, workers=4)
 
 
@@ -157,6 +158,28 @@ def phase_concurrency_only() -> list[tuple[Deployment, list[Trial]]]:
     ]
 
 
+def phase_workers_only() -> list[tuple[Deployment, list[Trial]]]:
+    """Isolate the worker count at Cloud Run's default containerConcurrency.
+
+    Answers the natural objection to the previous phase: if the platform admits
+    80 requests, surely 4 workers is too few? For CPU-bound work the answer is
+    no — workers are processes contending for cores, and containerConcurrency is
+    only an admission gate. This fixes cpu=4, concurrency=80, sync, maxScale=1
+    and sweeps workers across and well beyond the vCPU count.
+
+    Memory scales with the worker count because each gunicorn worker is a full
+    Python interpreter with ff3/pycryptodome loaded (~70 MB RSS); 32 workers in
+    2Gi would be OOM-killed, which would measure the wrong thing.
+    """
+    trials = [Trial(mode="fpe_decrypt", batch=5000)]
+    mem = {1: "2Gi", 2: "2Gi", 4: "2Gi", 8: "4Gi", 16: "8Gi", 32: "16Gi"}
+    return [
+        (Deployment(label=f"w{n}c80", cpu=4, memory=mem[n], workers=n,
+                    concurrency=80, min_instances=1, max_instances=1), trials)
+        for n in (1, 2, 4, 8, 16, 32)
+    ]
+
+
 def phase_cpu() -> list[tuple[Deployment, list[Trial]]]:
     """Vertical scaling: does throughput track vCPU when workers match?"""
     trials = [Trial(mode="fpe_decrypt", batch=5000)]
@@ -210,6 +233,7 @@ PHASES = {
     "batch": phase_batch,
     "concurrency": phase_concurrency,
     "concurrency_only": phase_concurrency_only,
+    "workers_only": phase_workers_only,
     "cpu": phase_cpu,
     "scale": phase_scale,
     "modes": phase_modes,
