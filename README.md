@@ -32,7 +32,8 @@ about BigQuery's protocol rather than the crypto —
 ```text
 ├── config/                   # shared.env contract (see below)
 ├── docs/
-│   └── performance-tuning.md # the study — applies to BOTH demos, start here
+│   ├── performance-tuning.md # the study — applies to BOTH demos, start here
+│   └── plans/                # designed-but-not-yet-run follow-up studies
 ├── shared/
 │   └── generate_mock_data.py # PII mock data generator, used by both demos
 ├── fpe/                      # vendor-free demo, and the measurement rig

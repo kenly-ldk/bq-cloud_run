@@ -1002,7 +1002,9 @@ other direction.
 
 What generalises is the method, not the number 4: fix everything else, set
 concurrency high, sweep workers, and check whether the run ranges overlap before
-believing a difference.
+believing a difference. Turning that method into a lookup table — measure two
+numbers about your workload, read off the config — is planned in
+[`plans/cloud-run-scaling-decision-guide.md`](plans/cloud-run-scaling-decision-guide.md).
 
 ### Vertical vs horizontal scaling
 
