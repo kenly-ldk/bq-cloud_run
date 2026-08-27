@@ -980,9 +980,27 @@ This does not contradict the earlier `c16-w16` row (22,501 rows/s, worse than
 The two settings interact exactly as the floor rule predicts: concurrency must be
 at least workers, or the extra processes never see traffic.
 
-**Measure this for your own workload.** The peak sits at 4x vCPU here; for a
-genuinely CPU-only transform it would sit at 1x, and for something I/O-bound
-higher still. What generalises is the method — fix everything else, set
+**Measure this for your own workload.** What sets the peak is how much of a
+request's wall time is spent *not* holding a core — waiting on a socket, or
+inside a C extension that has released the GIL. The more a process idles, the
+more processes it takes to keep the cores busy:
+
+| Workload | Time off-core | Useful slots |
+| --- | --- | --- |
+| Pure-Python CPU transform | ~none | ~1x vCPU |
+| This service (AES in C, JSON, sockets) | substantial | **4x vCPU, measured** |
+| Blocked on a remote API (e.g. Protegrity) | nearly all | many times vCPU |
+
+One important caveat on that third row: it needs more concurrent *slots*, but
+they should not be processes. A request waiting on a socket has released the
+GIL, so threads serve just as well and cost a fraction of the memory — 32
+gunicorn processes here needed 16 GiB, where 32 threads would need almost
+nothing extra. Reach for `gthread` with a high thread count when the work is
+I/O-bound, and for `sync` with more processes when it is CPU-bound, as here.
+That is the same split as the `gthread` rows in the first table, read from the
+other direction.
+
+What generalises is the method, not the number 4: fix everything else, set
 concurrency high, sweep workers, and check whether the run ranges overlap before
 believing a difference.
 
@@ -1198,7 +1216,8 @@ So §7's central conclusion **inverts**. For the CPU-bound FPE service, gunicorn
 Protegrity service, each request spends its time blocked on a socket, which
 *releases* the GIL — so threads would help there and adding processes mostly
 wastes memory. Do not copy the FPE worker-model numbers into a Protegrity
-deployment; re-run `--phase concurrency` against it.
+deployment; re-run `--phase workers_only` against it, and sweep
+`FPE_THREADS` with `gthread` rather than `FPE_WORKERS` with `sync`.
 
 Two further Protegrity-only concerns with no FPE analogue: the vendor API's own
 rate limiting under sustained load, and session lifetime (the service caches a
