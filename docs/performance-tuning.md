@@ -892,47 +892,11 @@ Three things fall out:
   (25,858) and 4 (25,728).
 
 Threads only help when the work releases the GIL — the `io` mode below, not
-`fpe_*`. How many *processes* to run is measured next, and the textbook answer
-turns out to be wrong.
+`fpe_*`.
 
-### So how many workers, then?
-
-The obvious objection to the previous table: if Cloud Run admits 80 requests,
-surely 4 workers is far too few? Standard advice says workers should track vCPU,
-because processes contend for cores. Isolating it — cpu=4, `containerConcurrency`
-80, sync, maxScale=1, 3 runs each — says otherwise:
-
-| workers | vs 4 vCPU | Median rows/s | Range across 3 runs | Spread |
-| --- | --- | --- | --- | --- |
-| 1 | 0.25x | 10,543 | 6,351 – 10,996 | 1.73x |
-| 2 | 0.5x | 12,689 | 11,982 – 14,499 | 1.21x |
-| 4 | **1x** | 26,980 | 22,793 – 26,996 | 1.18x |
-| 8 | 2x | 24,806 | 23,966 – 25,352 | 1.06x |
-| **16** | **4x** | **34,737** | **34,182 – 39,487** | 1.16x |
-| 32 | 8x | 29,172 | 27,980 – 31,107 | 1.11x |
-
-**16 workers on 4 vCPU beat 4 workers by 1.29x, and the ranges do not overlap** —
-22,793–26,996 against 34,182–39,487. Unlike the concurrency sweep, this is
-signal, not noise. Throughput then falls back at 32, so there is a real peak
-around 4x vCPU.
-
-So "workers = vCPU" is wrong here, and the reason is that the work is not the
-pure-Python CPU burn that rule assumes. FF3-1 runs AES through pycryptodome, a C
-extension, and every request also parses JSON, allocates, and reads and writes a
-socket. A process spends real time off-core, and extra processes fill those gaps.
-The rule only holds for work that genuinely occupies a core end to end.
-
-This does not contradict the earlier `c16-w16` row (22,501 rows/s, worse than
-`c16-w8`). That ran at `containerConcurrency` 16, so the admission gate starved
-16 workers. Feed the same 16 workers at concurrency 80 and they reach 34,737.
-The two settings interact exactly as the floor rule predicts: concurrency must be
-at least workers, or the extra processes never see traffic.
-
-**Measure this for your own workload.** The peak sits at 4x vCPU here; for a
-genuinely CPU-only transform it would sit at 1x, and for something I/O-bound
-higher still. What generalises is the method — fix everything else, set
-concurrency high, sweep workers, and check whether the run ranges overlap before
-believing a difference.
+Concurrency and workers move together in that table, so it cannot say what
+either should be on its own. The next two subsections isolate them in turn —
+concurrency first, because the worker result depends on it.
 
 ### So what should `containerConcurrency` be?
 
@@ -972,8 +936,8 @@ containerConcurrency >= workers        # or workers x threads for gthread
 ```
 
 Set it at or a little above your worker count so no process starves, and spend
-your tuning effort on `workers` and `maxScale`, which produced 3.7x and 3.2x
-respectively — effects far outside this noise band. Cloud Run's default of 80 is
+your tuning effort on `workers` (next subsection) and `maxScale`, which produced
+3.7x and 3.2x respectively — effects far outside this noise band. Cloud Run's default of 80 is
 fine here; there is no measured reason to lower it, and lowering it below your
 worker count is the one way to make things actively worse.
 
@@ -981,6 +945,46 @@ This also argues for reading the previous table conservatively. The
 worker-model conclusions there rest on gaps of 3x or more (6,882 → 25,728 rows/s,
 82 → 308 µs/row), which survive this noise comfortably. Differences of 20–30%
 between adjacent rows do not.
+
+### So how many workers, then?
+
+If concurrency should just sit at the default of 80, the obvious objection is
+that 4 workers must then be far too few. Standard advice says workers track
+vCPU, because processes contend for cores. Isolating it — cpu=4,
+`containerConcurrency` 80 as concluded above, sync, maxScale=1, 3 runs each —
+says otherwise:
+
+| workers | vs 4 vCPU | Median rows/s | Range across 3 runs | Spread |
+| --- | --- | --- | --- | --- |
+| 1 | 0.25x | 10,543 | 6,351 – 10,996 | 1.73x |
+| 2 | 0.5x | 12,689 | 11,982 – 14,499 | 1.21x |
+| 4 | **1x** | 26,980 | 22,793 – 26,996 | 1.18x |
+| 8 | 2x | 24,806 | 23,966 – 25,352 | 1.06x |
+| **16** | **4x** | **34,737** | **34,182 – 39,487** | 1.16x |
+| 32 | 8x | 29,172 | 27,980 – 31,107 | 1.11x |
+
+**16 workers on 4 vCPU beat 4 workers by 1.29x, and the ranges do not overlap** —
+22,793–26,996 against 34,182–39,487. Unlike the concurrency sweep just above,
+this clears the noise band comfortably: it is signal. Throughput then falls back at 32, so there is a real peak
+around 4x vCPU.
+
+So "workers = vCPU" is wrong here, and the reason is that the work is not the
+pure-Python CPU burn that rule assumes. FF3-1 runs AES through pycryptodome, a C
+extension, and every request also parses JSON, allocates, and reads and writes a
+socket. A process spends real time off-core, and extra processes fill those gaps.
+The rule only holds for work that genuinely occupies a core end to end.
+
+This does not contradict the earlier `c16-w16` row (22,501 rows/s, worse than
+`c16-w8`). That ran at `containerConcurrency` 16, so the admission gate starved
+16 workers. Feed the same 16 workers at concurrency 80 and they reach 34,737.
+The two settings interact exactly as the floor rule predicts: concurrency must be
+at least workers, or the extra processes never see traffic.
+
+**Measure this for your own workload.** The peak sits at 4x vCPU here; for a
+genuinely CPU-only transform it would sit at 1x, and for something I/O-bound
+higher still. What generalises is the method — fix everything else, set
+concurrency high, sweep workers, and check whether the run ranges overlap before
+believing a difference.
 
 ### Vertical vs horizontal scaling
 
