@@ -1202,51 +1202,77 @@ concerns the BigQuery side transfers unchanged to
 | §5 search by tokenizing the term | Needs only *deterministic* tokenization, which Protegrity FPE/tokenization data elements are by default |
 | §6 access-control patterns | Pure SQL shapes; swap `fpe_decrypt` for `pii_detokenize_fpe_multi` |
 
-**Does not transfer** — §7, and this is the important caveat. The two services
-have opposite performance profiles:
+**Does not transfer** — §7. But *which way* it fails to transfer depends
+entirely on how Protegrity is deployed, and the two modes are opposites.
 
-| | FPE service | Protegrity service |
+### Two Protegrity deployments, two profiles
+
+| | Developer Edition (this repo) | Production PEP |
 | --- | --- | --- |
-| Work per row | FF3-1 in-process, ~77 µs | HTTP call to a vendor API |
-| Bound by | **CPU** | **Network / vendor latency** |
-| Transit share of end-to-end | ~6% | dominant |
+| Where the crypto runs | Protegrity's hosted API | **In the container, locally** |
+| Keys | never held locally | **fetched once from the ESA, cached in memory** |
+| Per-row work | an HTTPS round trip | native-code tokenize/detokenize |
+| Bound by | network + vendor rate limit | **CPU** |
 
-So §7's central conclusion **inverts**. For the CPU-bound FPE service, gunicorn
-*processes* buy parallelism and threads are actively harmful (the GIL). For the
-Protegrity service, each request spends its time blocked on a socket, which
-*releases* the GIL — so threads would help there and adding processes mostly
-wastes memory. Do not copy the FPE worker-model numbers into a Protegrity
-deployment.
+This repo implements the first, and that is checkable rather than assumed: the
+`appython` session caches only a JWT ([`protector.py:121`](../protegrity/service/appython/protector.py#L121))
+and every protect/unprotect posts to `api.developer-edition.protegrity.com`
+([`payload_builder.py:27`](../protegrity/service/appython/service/payload_builder.py#L27),
+[`request_handler.py:32`](../protegrity/service/appython/service/request_handler.py#L32)).
+Nothing is computed locally.
 
-**Concretely: that service wants `gthread`.** Three things point the same way,
-though none of this is measured — the API access needed to test it is gone, so
-treat it as reasoning from the code rather than a result.
+**A production deployment is the opposite**, and is what a real customer runs. A
+PEP pulls policy and keys from the ESA once, caches them in memory, and performs
+the transformation in-process. There is no per-row network call, so it is a
+**CPU workload, like the FPE service** — not the I/O workload the Developer
+Edition code implies.
 
-1. **Its per-request work is a blocking socket wait.** Every protect/unprotect
-   is a `requests.post` to the vendor API
-   ([`request_handler.py:32`](../protegrity/service/appython/service/request_handler.py#L32)),
-   which releases the GIL for its whole duration. That is precisely the case
-   threads serve and processes serve expensively.
-2. **It was written for threads and is deployed without them.** The session
-   cache is a module-global guarded by a `threading.Lock` with double-checked
-   locking ([`main.py:16-38`](../protegrity/service/main.py#L16)) — a design
-   that only pays off when threads share a process. But its Dockerfile runs a
-   bare `gunicorn main:app`
-   ([`Dockerfile:13`](../protegrity/service/Dockerfile#L13)), so it gets
-   gunicorn's default of **one sync worker**: one request at a time, with the
-   thread-safe cache protecting nothing.
-3. **Processes would multiply the auth traffic.** Each `sync` worker holds its
-   own `cached_session`, so N workers mean N sessions and N times the login
-   calls against a vendor API that rate-limits. Threads share one session.
+### So is production Protegrity CPU-intensive?
 
-So the shape to try is `gthread` with a high thread count and a low worker
-count, sweeping `FPE_THREADS` rather than `FPE_WORKERS`. Expect the ceiling to
-be the vendor API's rate limit rather than the container — which is the one
-thing no amount of Cloud Run tuning will move.
+CPU-bound, yes. *Intensive*, probably not — and the distinction decides the
+tuning.
 
-Two further Protegrity-only concerns with no FPE analogue: the vendor API's own
-rate limiting under sustained load, and session lifetime (the service caches a
-session for 5 minutes, see [`main.py`](../protegrity/service/main.py)).
+The PEP's core is native code, not Python. Our FF3-1 costs ~77 µs/row precisely
+because it is pure Python; the same algorithm in C is typically one to two
+orders of magnitude cheaper. The `modes` table in §7 is a calibrated ruler for
+placing it:
+
+| Per-row cost | Throughput | Regime |
+| --- | --- | --- |
+| `noop`, 0 µs | 403,000 rows/s | pure transit floor |
+| `hmac`, 7 µs | 214,000 rows/s | cheap native-ish crypto |
+| `fpe_decrypt`, 118 µs | 26,000 rows/s | pure-Python FF3-1 |
+
+If a production PEP tokenizes in single-digit µs/row — plausible for native
+code, though **we have not measured it and cannot** — it lands near the `hmac`
+row. That regime is **transit-dominated, not compute-dominated**, which inverts
+§7 again, in the opposite direction from the Developer Edition:
+
+- **Worker count matters little.** There is not much CPU to parallelise. The 4x
+  vCPU finding is an artefact of expensive Python crypto.
+- **Batch size matters more.** Per-request overhead is a large share of a cheap
+  request, so the flat 1,000–50,000 curve in §7 would not stay flat.
+- **Instance count matters little**; the bottleneck moves to the wire and to
+  BigQuery.
+
+**How to settle it in an afternoon.** Deploy the real PEP service with
+per-request logging like [`main.py`](../fpe/service/main.py) emits, run any of
+the sweeps, and read µs/row off the logs. Compare against the three rows above:
+near `hmac` means tune batching, near `fpe_decrypt` means tune workers. Every
+BigQuery-side finding in §§1–6 applies either way.
+
+### Developer Edition only
+
+If you *are* running the Developer Edition code in this repo, then it is
+I/O-bound and wants `gthread` — and it currently gets neither threads nor
+processes. Its Dockerfile runs a bare `gunicorn main:app`
+([`Dockerfile:13`](../protegrity/service/Dockerfile#L13)), so gunicorn defaults
+to **one sync worker**, handling one request at a time, while the session cache
+sits behind a `threading.Lock`
+([`main.py:16-38`](../protegrity/service/main.py#L16)) that protects nothing.
+Sync workers would also each hold their own session, multiplying login traffic
+against a rate-limited API, where threads share one. None of this is measured —
+the access needed to test it is gone.
 
 ---
 

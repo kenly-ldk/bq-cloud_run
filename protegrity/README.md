@@ -24,8 +24,9 @@
 >   settings, so gunicorn defaults to a single `sync` worker. The service is
 >   written for threads — its session cache is a module-global behind a
 >   `threading.Lock` ([`service/main.py`](service/main.py)) — but never gets
->   any. Since each request blocks on a call to the vendor API, this wants
->   `gthread` with a high thread count; see
+>   any. Because *this* code calls the hosted Developer Edition API per row, it
+>   is I/O-bound and wants `gthread`. Note a **production PEP is the opposite** —
+>   keys cached in memory, crypto done locally, so CPU-bound. See
 >   [the study](../docs/performance-tuning.md#does-this-apply-to-the-protegrity-demo).
 > - **Credentials are plaintext env vars** in the manifest. Use Secret Manager.
 >
