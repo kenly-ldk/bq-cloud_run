@@ -1216,8 +1216,33 @@ So §7's central conclusion **inverts**. For the CPU-bound FPE service, gunicorn
 Protegrity service, each request spends its time blocked on a socket, which
 *releases* the GIL — so threads would help there and adding processes mostly
 wastes memory. Do not copy the FPE worker-model numbers into a Protegrity
-deployment; re-run `--phase workers_only` against it, and sweep
-`FPE_THREADS` with `gthread` rather than `FPE_WORKERS` with `sync`.
+deployment.
+
+**Concretely: that service wants `gthread`.** Three things point the same way,
+though none of this is measured — the API access needed to test it is gone, so
+treat it as reasoning from the code rather than a result.
+
+1. **Its per-request work is a blocking socket wait.** Every protect/unprotect
+   is a `requests.post` to the vendor API
+   ([`request_handler.py:32`](../protegrity/service/appython/service/request_handler.py#L32)),
+   which releases the GIL for its whole duration. That is precisely the case
+   threads serve and processes serve expensively.
+2. **It was written for threads and is deployed without them.** The session
+   cache is a module-global guarded by a `threading.Lock` with double-checked
+   locking ([`main.py:16-38`](../protegrity/service/main.py#L16)) — a design
+   that only pays off when threads share a process. But its Dockerfile runs a
+   bare `gunicorn main:app`
+   ([`Dockerfile:13`](../protegrity/service/Dockerfile#L13)), so it gets
+   gunicorn's default of **one sync worker**: one request at a time, with the
+   thread-safe cache protecting nothing.
+3. **Processes would multiply the auth traffic.** Each `sync` worker holds its
+   own `cached_session`, so N workers mean N sessions and N times the login
+   calls against a vendor API that rate-limits. Threads share one session.
+
+So the shape to try is `gthread` with a high thread count and a low worker
+count, sweeping `FPE_THREADS` rather than `FPE_WORKERS`. Expect the ceiling to
+be the vendor API's rate limit rather than the container — which is the one
+thing no amount of Cloud Run tuning will move.
 
 Two further Protegrity-only concerns with no FPE analogue: the vendor API's own
 rate limiting under sustained load, and session lifetime (the service caches a

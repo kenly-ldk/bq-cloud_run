@@ -19,6 +19,14 @@
 >   across three Protegrity containers, but `appython` calls the *remote*
 >   Developer Edition API at `api.developer-edition.protegrity.com`. The
 >   localhost sidecars serve discovery only, which nothing here invokes.
+> - **It runs one request at a time.** The Dockerfile's `gunicorn main:app`
+>   ([`service/Dockerfile`](service/Dockerfile)) passes no worker or thread
+>   settings, so gunicorn defaults to a single `sync` worker. The service is
+>   written for threads — its session cache is a module-global behind a
+>   `threading.Lock` ([`service/main.py`](service/main.py)) — but never gets
+>   any. Since each request blocks on a call to the vendor API, this wants
+>   `gthread` with a high thread count; see
+>   [the study](../docs/performance-tuning.md#does-this-apply-to-the-protegrity-demo).
 > - **Credentials are plaintext env vars** in the manifest. Use Secret Manager.
 >
 > **For a runnable demo, use [`../fpe/`](../fpe/) instead** — same BigQuery
