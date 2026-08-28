@@ -22,6 +22,29 @@ Usage:
     python fpe/scripts/sweep.py --phase concurrency
     python fpe/scripts/sweep.py --phase all --rows 500000
     python fpe/scripts/sweep.py --list
+
+Statistical protocol — decided once (decision-guide plan, Phase 0d) so it does
+not get re-litigated per result:
+
+  * **5 iterations** for the scaling study. At 2, two runs of the *same* config
+    differed by 2.16x, wider than most of the effects being looked for.
+  * **min/median/max, and overlap before difference.** `analyze.py` will not
+    call one config better than another while their [min, max] ranges overlap.
+  * **Adaptive row count.** Cells in this study differ in throughput by over
+    100x (one sync worker on a per-row-I/O workload versus 64 threads), so no
+    single row count gives every cell a measurable run. Each cell is piloted
+    and sized to about `--target-seconds` of work. Throughput is a rate, so
+    differently-sized cells stay comparable; the fixed per-query overhead share
+    does not, which is why every cell targets the same duration.
+  * **No interleaving.** Interleaving configs to cancel drift would multiply
+    the deploy count — the dominant cost at ~75 s each — by the iteration
+    count. Instead each phase ends with a **drift sentinel**: the phase's first
+    config is redeployed and re-run, and the result is flagged if its range no
+    longer overlaps the original. That tests exactly the assumption
+    interleaving would have protected, for one extra deploy per phase.
+  * **One log fetch per cell, not per iteration.** Cloud Logging needs ~20 s to
+    settle (LOG_SETTLE_S), which at 5 iterations cost more than the iterations
+    did. Iterations run back to back; the window is split by timestamp after.
 """
 
 from __future__ import annotations
@@ -39,10 +62,19 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config._loader import load, require  # noqa: E402
 
+from calibration import CONTAINER, Curve  # noqa: E402
+from workloads import WORKLOADS  # noqa: E402
+
 from google.cloud import bigquery  # noqa: E402
+
+#: CLI overrides that individual phase definitions read, populated in main().
+#: Lets a phase be parameterised (which slot counts, which workload) without
+#: threading arguments through the PHASES registry.
+OPTS: dict = {}
 
 
 # --------------------------------------------------------------------------
@@ -79,6 +111,17 @@ class Deployment:
             "REVISION_SUFFIX": self.label,
         }
 
+    @property
+    def slots(self) -> int:
+        """Requests this container can have *executing* at once.
+
+        Not `containerConcurrency`, which is only an admission limit. For
+        `sync`, gunicorn runs one request per worker process; for `gthread`,
+        `threads` requests per process. This is the quantity the Phase 2 rule
+        predicts, so it belongs on the deployment rather than in each phase.
+        """
+        return self.workers * (self.threads if self.worker_class == "gthread" else 1)
+
 
 @dataclass(frozen=True)
 class Trial:
@@ -88,6 +131,18 @@ class Trial:
     batch: int
     column: str = "ssn"
     data_element: str = "ssn"
+    #: Explicit remote function name. The mode x batch grid is named
+    #: `<mode>_b<batch>`, but the workload points carry their cost parameters in
+    #: the name too (`mixed_r4s0_b5000`), so those must be named outright.
+    function: str | None = None
+    #: Workload id (W1..W7) for the record, when this trial realises one.
+    workload: str | None = None
+    #: Fixed row count. None means size the run adaptively to --target-seconds.
+    rows: int | None = None
+
+    @property
+    def name(self) -> str:
+        return self.function or f"{self.mode}_b{self.batch}"
 
 
 # The baseline used by every phase that is not varying infrastructure.
@@ -229,6 +284,235 @@ def phase_throttling() -> list[tuple[Deployment, list[Trial]]]:
     ]
 
 
+# --------------------------------------------------------------------------
+# The scaling decision guide (docs/plans/cloud-run-scaling-decision-guide.md)
+#
+# Everything above measures one workload — FF3-1, ~118 µs/row, CPU-bound — and
+# its conclusions demonstrably do not generalise. These phases sweep the
+# *workload* as well as the config, so the output can be a lookup table rather
+# than a war story.
+# --------------------------------------------------------------------------
+
+#: Memory per worker *process*. Each is a full interpreter with ff3 and
+#: pycryptodome resident, ~70 MB RSS; 32 of them in 2Gi are OOM-killed, which
+#: measures the wrong thing. Threads share the interpreter and cost almost
+#: nothing by comparison, so this keys on processes only.
+MEMORY_FOR_WORKERS = {1: "2Gi", 2: "2Gi", 4: "4Gi", 8: "4Gi", 16: "8Gi", 32: "16Gi"}
+
+#: The worker models under test. `sync` buys parallelism with processes,
+#: `gthread` with threads; which one wins is the question, and the answer is a
+#: function of the workload, not of the service.
+SYNC_ARM = [(n, 1, "sync") for n in (1, 2, 4, 8, 16, 32)]
+GTHREAD_ARM = [(1, 8, "gthread"), (1, 32, "gthread"),
+               (2, 16, "gthread"), (4, 16, "gthread")]
+
+#: Worker models to run per workload. The full 6 x 10 grid is 60 deploys and
+#: ~4.5 hours, and the plan says to trim, so:
+#:   W2, W5   full coverage — they are the two that map onto real customer
+#:            deployments (production PEP, Developer Edition).
+#:   W4       sync arm already measured by `workers_only`; only the gthread arm
+#:            is new, so only that is re-run.
+#:   W1, W3   enough points to establish the shape, not to resolve an optimum.
+#:   W6       full gthread arm, because a hybrid workload is where threads are
+#:            expected to win and that claim needs the resolution.
+MATRIX_COVERAGE: dict[str, list[tuple[int, int, str]]] = {
+    "W1": [(1, 1, "sync"), (4, 1, "sync"), (16, 1, "sync"), (1, 32, "gthread")],
+    "W2": SYNC_ARM + GTHREAD_ARM,
+    "W3": [(1, 1, "sync"), (4, 1, "sync"), (16, 1, "sync"), (32, 1, "sync"),
+           (1, 32, "gthread")],
+    "W4": [(1, 32, "gthread"), (4, 16, "gthread")],
+    "W5": SYNC_ARM + GTHREAD_ARM,
+    "W6": [(1, 1, "sync"), (4, 1, "sync"), (16, 1, "sync"), (32, 1, "sync")]
+          + GTHREAD_ARM,
+}
+
+
+def _model_label(workers: int, threads: int, worker_class: str) -> str:
+    return f"s{workers}" if worker_class == "sync" else f"g{workers}x{threads}"
+
+
+def _matrix_deployment(wid: str, workers: int, threads: int, worker_class: str,
+                       cpu: int = 4, max_instances: int = 1) -> Deployment:
+    """One cell's revision. containerConcurrency is held at Cloud Run's default.
+
+    80 is above every slot count in the matrix (max 64), so it never starves a
+    worker — the one thing §7 found containerConcurrency can actually do. It is
+    held fixed precisely so it is not a second moving knob.
+    """
+    return Deployment(
+        label=f"{wid.lower()}-{_model_label(workers, threads, worker_class)}",
+        cpu=cpu,
+        memory=MEMORY_FOR_WORKERS[workers],
+        # Twice the slot count so admission never starves the workers (§7's
+        # floor rule), but containerConcurrency is capped at 1000 by Cloud Run —
+        # `gcloud run services replace` rejects anything above it outright.
+        concurrency=min(1000, max(
+            80, 2 * workers * (threads if worker_class == "gthread" else 1))),
+        workers=workers,
+        threads=threads,
+        worker_class=worker_class,
+        min_instances=1,
+        max_instances=max_instances,
+    )
+
+
+def _workload_trial(wid: str, batch: int | None = None) -> Trial:
+    w = WORKLOADS[wid]
+    if batch is None or batch == w.batch:
+        return Trial(mode=w.mode, batch=w.batch, function=w.function, workload=wid)
+    return Trial(mode=w.mode, batch=batch,
+                 function=f"{w.mode}{w.tag}_b{batch}", workload=wid)
+
+
+def phase_calibrate_cpu() -> list[tuple[Deployment, list[Trial]]]:
+    """Measure the container's `rounds` -> µs/row curve. Phase 0a.
+
+    One worker at containerConcurrency 1, so nothing contends for a core and
+    the number is the container's raw single-slot cost. That matters: the one
+    pre-existing data point (`cpu` rounds=100 at 122-133 µs/row) was taken with
+    4 workers on 4 vCPU and so conflates contention with speed.
+
+    The result is read off the service logs, not off query wall clock, and
+    `analyze.py` fits it. Paste the fitted Curve into calibration.CONTAINER.
+    """
+    from generate_remote_functions import CALIBRATION_BATCH, CALIBRATION_ROUNDS
+
+    cfg = Deployment(label="calib", cpu=4, memory="2Gi", concurrency=1,
+                     workers=1, threads=1, worker_class="sync",
+                     min_instances=1, max_instances=1)
+    return [(cfg, [Trial(mode="cpu", batch=CALIBRATION_BATCH,
+                         function=f"cpu_r{r}_b{CALIBRATION_BATCH}",
+                         rows=OPTS.get("calibration_rows", 50_000))
+                   for r in CALIBRATION_ROUNDS])]
+
+
+def phase_profile() -> list[tuple[Deployment, list[Trial]]]:
+    """The measurement recipe itself, run against every workload point.
+
+    This is what the decision guide asks a reader to do to their *own* service,
+    made executable: deploy one worker at containerConcurrency 1, send one
+    modest query, and read two numbers off the service logs —
+
+        us_per_row      how expensive a row is
+        cpu_share       how much of that is spent holding a core
+
+    One slot and one admitted request matter. With several requests in flight
+    the thread is descheduled by its neighbours and `cpu_share` measures
+    contention rather than the workload. Small runs, because this is a
+    profile, not a throughput measurement.
+    """
+    cfg = Deployment(label="profile", cpu=4, memory="2Gi", concurrency=1,
+                     workers=1, threads=1, worker_class="sync",
+                     min_instances=1, max_instances=1)
+    # Enough rows to average over many batches, few enough that the per-row
+    # I/O points still finish in seconds.
+    rows = {"W1": 200_000, "W2": 200_000, "W3": 100_000, "W4": 50_000,
+            "W5": 10_000, "W6": 20_000, "W7": 20_000}
+    return [(cfg, [
+        Trial(mode=WORKLOADS[w].mode, batch=WORKLOADS[w].batch,
+              function=WORKLOADS[w].function, workload=w, rows=rows[w])
+        for w in WORKLOADS
+    ])]
+
+
+def phase_workload_matrix() -> list[tuple[Deployment, list[Trial]]]:
+    """Phase 1: workload x worker model, everything else nailed down.
+
+    Fixed: cpu=4, containerConcurrency=80, maxScale=1, minScale=1, batch 5000.
+    Varying: the workload's per-row cost, and how the container is allowed to
+    execute requests concurrently. Nothing else.
+    """
+    only = OPTS.get("workloads") or list(MATRIX_COVERAGE)
+    plan = []
+    for wid in only:
+        for workers, threads, worker_class in MATRIX_COVERAGE[wid]:
+            plan.append((_matrix_deployment(wid, workers, threads, worker_class),
+                         [_workload_trial(wid)]))
+    return plan
+
+
+def phase_rule_check() -> list[tuple[Deployment, list[Trial]]]:
+    """Phase 2: falsify the fitted rule on the held-out workload W7.
+
+    W7 is deliberately absent from MATRIX_COVERAGE. Fit `optimal slots =
+    cores x (1 + wait/service)` on Phase 1, predict W7's optimum, then run only
+    that config and its neighbours. If the measured optimum's range contains
+    the prediction, the rule survived; if it does not, it was curve-fitting.
+
+    Slot counts come from --slots so the prediction can be made *after* seeing
+    Phase 1 rather than being baked in here.
+    """
+    wid = OPTS.get("workload", "W7")
+    slots = OPTS.get("slots") or [16, 44, 84, 168]
+    plan = []
+    for n in slots:
+        # Realised as threads on a small number of processes: W7 is
+        # wait-dominated, so slots should be cheap, and 168 processes would need
+        # more memory than a 4 vCPU instance can have.
+        workers = 4 if n >= 16 else 1
+        threads = max(1, n // workers)
+        plan.append((_matrix_deployment(wid, workers, threads, "gthread"),
+                     [_workload_trial(wid)]))
+    return plan
+
+
+def phase_scale_axis() -> list[tuple[Deployment, list[Trial]]]:
+    """Phase 3: vertical (vCPU) and horizontal (maxScale) for a given workload.
+
+    Run per workload with --workload and the Phase 1 winner in --workers /
+    --threads / --worker-class. The vCPU arm rescales the worker count with the
+    vCPU count, because holding workers fixed while vCPU changes measures
+    neither: §7's vertical table did exactly that and produced a floor rather
+    than a curve.
+    """
+    wid = OPTS.get("workload", "W2")
+    workers = OPTS.get("workers", 4)
+    threads = OPTS.get("threads", 1)
+    worker_class = OPTS.get("worker_class", "sync")
+    base_cpu = 4
+
+    plan = []
+    for cpu in (1, 2, 4, 8):
+        scaled = max(1, round(workers * cpu / base_cpu))
+        cfg = _matrix_deployment(wid, scaled, threads, worker_class, cpu=cpu)
+        plan.append((
+            Deployment(**{**asdict(cfg),
+                          "label": f"{wid.lower()}-cpu{cpu}-"
+                                   f"{_model_label(scaled, threads, worker_class)}"}),
+            [_workload_trial(wid)],
+        ))
+    for max_instances in (1, 2, 4, 8):
+        cfg = _matrix_deployment(wid, workers, threads, worker_class,
+                                 max_instances=max_instances)
+        plan.append((
+            Deployment(**{**asdict(cfg),
+                          "label": f"{wid.lower()}-max{max_instances}"}),
+            [_workload_trial(wid)],
+        ))
+    return plan
+
+
+def phase_batch_at_cheap() -> list[tuple[Deployment, list[Trial]]]:
+    """Phase 3b: re-run the batch-size question at a *cheap* workload.
+
+    §7 found batch size irrelevant above ~1,000 rows, but measured it where a
+    request carried 118 µs/row x 5,000 rows = 0.6 s of compute, against which
+    per-request overhead is invisible. At W2's 5 µs/row the same request is
+    25 ms, so the overhead share is ~25x larger and the curve should not stay
+    flat. If it does, that is itself the finding.
+
+    One deployment, eight trials: batch size lives in the function definition,
+    so this costs a single deploy.
+    """
+    wid = OPTS.get("workload", "W2")
+    from generate_remote_functions import BATCH_SIZES
+
+    cfg = _matrix_deployment(wid, OPTS.get("workers", 4), OPTS.get("threads", 1),
+                             OPTS.get("worker_class", "sync"))
+    return [(Deployment(**{**asdict(cfg), "label": f"{wid.lower()}-batch"}),
+             [_workload_trial(wid, batch=b) for b in BATCH_SIZES])]
+
+
 PHASES = {
     "batch": phase_batch,
     "concurrency": phase_concurrency,
@@ -238,7 +522,19 @@ PHASES = {
     "scale": phase_scale,
     "modes": phase_modes,
     "throttling": phase_throttling,
+    # The scaling decision guide
+    "calibrate_cpu": phase_calibrate_cpu,
+    "profile": phase_profile,
+    "workload_matrix": phase_workload_matrix,
+    "rule_check": phase_rule_check,
+    "scale_axis": phase_scale_axis,
+    "batch_at_cheap": phase_batch_at_cheap,
 }
+
+#: Phases in the scaling study. `--phase all` keeps its original meaning (the
+#: §7 sweep) so the existing raw files stay reproducible; these are opted into.
+STUDY_PHASES = ["calibrate_cpu", "profile", "workload_matrix", "rule_check",
+                "scale_axis", "batch_at_cheap"]
 
 
 # --------------------------------------------------------------------------
@@ -1040,14 +1336,19 @@ def run_query(client: bigquery.Client, sql: str) -> dict:
     }
 
 
-def fetch_logs(
+def fetch_log_entries(
     project: str,
     service: str,
     start: datetime,
     end: datetime,
     events: tuple[str, ...] = ("batch",),
-) -> list[dict]:
-    """Pull the structured logs the service emitted during a window.
+) -> list[tuple[datetime, dict]]:
+    """Pull the structured logs the service emitted during a window, with times.
+
+    The timestamp is kept, not discarded, for two reasons: a whole cell's
+    iterations are now fetched in one call and have to be split apart again,
+    and reconstructing *when* each request ran is the only way to measure how
+    many really overlapped (see `peak_concurrency`).
 
     `events` selects which event types to include — the retry probe needs
     "batch_error" too, since a retried invocation never produces a "batch".
@@ -1071,7 +1372,76 @@ def fetch_logs(
         entries = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError:
         return []
-    return [e.get("jsonPayload", {}) for e in entries if e.get("jsonPayload")]
+
+    out: list[tuple[datetime, dict]] = []
+    for e in entries:
+        payload = e.get("jsonPayload")
+        if not payload:
+            continue
+        raw = e.get("timestamp") or e.get("receiveTimestamp")
+        try:
+            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        out.append((ts, payload))
+    out.sort(key=lambda tp: tp[0])
+    return out
+
+
+def fetch_logs(
+    project: str,
+    service: str,
+    start: datetime,
+    end: datetime,
+    events: tuple[str, ...] = ("batch",),
+) -> list[dict]:
+    """Payload-only view, for the probes that do not care when things happened."""
+    return [p for _, p in fetch_log_entries(project, service, start, end, events)]
+
+
+def peak_concurrency(entries: list[tuple[datetime, dict]]) -> dict:
+    """How many requests were *actually* executing at once, across all workers.
+
+    The per-request `inflight` field cannot answer this: it is counted inside
+    one process, so with 16 sync workers it reads 1 no matter what. And
+    `worker_processes` is a count of distinct pids seen over the whole window,
+    which says every worker was used at some point, not that any two ran
+    together.
+
+    Each log line is written when the handler finishes, so the request occupied
+    [t - total_ms, t]. Sweeping those intervals gives the real peak, and the
+    time-weighted mean gives the sustained level — which is the one the Phase 2
+    rule is about, since a single momentary peak does not set throughput.
+    """
+    spans = []
+    for ts, p in entries:
+        total_ms = p.get("total_ms")
+        if total_ms is None:
+            continue
+        spans.append((ts.timestamp() - float(total_ms) / 1000.0, ts.timestamp()))
+    if not spans:
+        return {}
+
+    events: list[tuple[float, int]] = []
+    for a, b in spans:
+        events.append((a, 1))
+        events.append((b, -1))
+    events.sort()
+
+    live = peak = 0
+    prev_t = events[0][0]
+    area = 0.0
+    for t, delta in events:
+        area += live * (t - prev_t)
+        prev_t = t
+        live += delta
+        peak = max(peak, live)
+    window = events[-1][0] - events[0][0]
+    return {
+        "concurrency_peak": peak,
+        "concurrency_mean": round(area / window, 2) if window > 0 else 0,
+        "busy_window_s": round(window, 2),
+    }
 
 
 def summarise_logs(payloads: list[dict]) -> dict:
@@ -1084,8 +1454,13 @@ def summarise_logs(payloads: list[dict]) -> dict:
     per_row = [float(p.get("us_per_row", 0)) for p in payloads if p.get("us_per_row")]
     instances = {p.get("instance") for p in payloads if p.get("instance")}
     procs = {(p.get("instance"), p.get("pid")) for p in payloads}
+    cpu_row = [float(p["cpu_us_per_row"]) for p in payloads
+               if p.get("cpu_us_per_row") is not None]
+    share = [float(p["cpu_share"]) for p in payloads if p.get("cpu_share") is not None]
 
     return {
+        "cpu_us_per_row_median": round(statistics.median(cpu_row), 2) if cpu_row else None,
+        "cpu_share_median": round(statistics.median(share), 3) if share else None,
         "log_batches": len(payloads),
         "log_rows_total": sum(rows),
         "batch_rows_mean": round(statistics.mean(rows), 1) if rows else 0,
@@ -1103,27 +1478,247 @@ def summarise_logs(payloads: list[dict]) -> dict:
     }
 
 
-def build_sql(project: str, dataset: str, table: str, trial: Trial, rows: int) -> str:
-    fn = f"`{project}.{dataset}`.{trial.mode}_b{trial.batch}"
+def summarise_entries(entries: list[tuple[datetime, dict]]) -> dict:
+    """`summarise_logs` plus the reconstructed cross-worker concurrency."""
+    return {
+        **summarise_logs([p for _, p in entries]),
+        **peak_concurrency(entries),
+    }
+
+
+def build_sql(project: str, dataset: str, table: str, trial: Trial, rows: int,
+              table_rows: int | None = None) -> str:
+    """The measurement query, replicating the source table when `rows` exceeds it.
+
+    The transit floor is ~400,000 rows/s, so a 25-second run of a cheap workload
+    needs ~10,000,000 rows and the demo table holds 1,000,000. Cross-joining
+    against `GENERATE_ARRAY` supplies them for one table scan.
+
+    Repeating values is safe here: every mode's cost is per row and independent
+    of the value, and BigQuery treats remote functions as non-deterministic, so
+    it will not collapse the duplicates (that is the same property §5 relies on
+    when it forces a single invocation with DECLARE/SET).
+    """
+    fn = f"`{project}.{dataset}`.{trial.name}"
+    src = f"`{project}.{dataset}.{table}`"
+    if table_rows and rows > table_rows:
+        copies = -(-rows // table_rows)  # ceil
+        inner = (f"SELECT t.{trial.column} FROM {src} t, "
+                 f"UNNEST(GENERATE_ARRAY(1, {copies})) LIMIT {rows}")
+    else:
+        inner = f"SELECT {trial.column} FROM {src} LIMIT {rows}"
     return (
         f"SELECT SUM(LENGTH({fn}({trial.column}, '{trial.data_element}')))\n"
-        f"FROM (SELECT {trial.column} FROM `{project}.{dataset}.{table}` "
-        f"LIMIT {rows})"
+        f"FROM ({inner})"
     )
+
+
+# --------------------------------------------------------------------------
+# Adaptive run sizing
+#
+# The scaling study spans workloads from ~400,000 rows/s (transit floor) to
+# ~500 rows/s (one slot, per-row I/O) — a factor of 800. No fixed row count
+# gives all of those a measurable run: whatever number makes the slow cell
+# finish this century makes the fast cell finish before it has warmed up.
+#
+# So each cell is piloted, then sized to a common *duration*. Throughput is a
+# rate and stays comparable; what does not is the fixed per-query overhead
+# share, which is why every cell targets the same seconds rather than each
+# picking its own.
+# --------------------------------------------------------------------------
+
+#: Never size below this: too few rows and BigQuery's own query overhead, not
+#: the service, is what is being timed.
+MIN_SIZED_ROWS = 5_000
+
+#: First pilot. Small enough to be nearly free on the slowest cell in the study
+#: (one sync worker at 2 ms/row = ~4 s).
+PILOT_ROWS = 2_000
+
+#: Growth cap per pilot step. Protects against a pilot dominated by query
+#: overhead projecting an absurd row count in one jump.
+PILOT_GROWTH_CAP = 8
+
+#: Requests per slot the smallest pilot must offer. Below one request per slot
+#: the run is quantised by batch size rather than by the service: a 10,000-row
+#: pilot at batch 5,000 is two HTTP requests, so eight slots measure the
+#: throughput of two and the rate that comes out is meaningless. This bit — a
+#: pilot projected 584,100 rows for a 25 s target and produced 169 s runs.
+PILOT_REQUESTS_PER_SLOT = 2
+
+
+def size_run(client: bigquery.Client, sql_for, target_s: float, max_rows: int,
+             floor_rows: int = 0) -> tuple[int, list[tuple[int, float]], bool]:
+    """Pilot a cell and return (rows, pilot history, hit_ceiling).
+
+    Doubles as the warmup: the first pilot query pays cipher construction and
+    lazy imports, which would otherwise land on iteration 1.
+
+    Two pilot points give the intercept as well as the slope — elapsed is
+    `query overhead + rows / rate`, and ignoring the overhead consistently
+    undershoots on cheap workloads where it is most of the measurement. But the
+    two-point estimate is only used when the two elapsed times actually differ:
+    when they do not, `(r1 - r0) / (e1 - e0)` divides by noise and returns a
+    rate an order of magnitude too high. Every projection is additionally
+    bounded by 1.5x the naive proportional estimate, so no single bad fit can
+    run away.
+    """
+    rows, history = max(PILOT_ROWS, floor_rows), []
+    for _ in range(5):
+        rows = max(MIN_SIZED_ROWS if history else 1, min(rows, max_rows))
+        elapsed = run_query(client, sql_for(rows))["elapsed_s"]
+        history.append((rows, elapsed))
+        if elapsed >= 0.6 * target_s or rows >= max_rows:
+            break
+
+        proportional = rows * target_s / max(elapsed, 0.05)
+        projected = proportional
+        if len(history) >= 2:
+            (r0, e0), (r1, e1) = history[-2], history[-1]
+            # Require the elapsed times to be separated by more than noise
+            # before trusting a slope drawn through them.
+            if e1 - e0 > 0.2 * e1:
+                rate = (r1 - r0) / (e1 - e0)
+                overhead = e1 - r1 / rate
+                projected = rate * (target_s - overhead)
+        rows = int(max(rows * 2, min(projected, proportional * 1.5,
+                                     rows * PILOT_GROWTH_CAP)))
+    rows = max(MIN_SIZED_ROWS, min(rows, max_rows))
+    return rows, history, rows >= max_rows
+
+
+def run_cell(client: bigquery.Client, ctx: dict, phase_name: str,
+             cfg: Deployment, trial: Trial, *, sentinel: bool = False) -> list[dict]:
+    """Pilot, size, and run every iteration of one (deployment, trial) cell.
+
+    All iterations run back to back and the service logs are fetched once for
+    the whole cell, then split by timestamp. Paying LOG_SETTLE_S per iteration
+    instead cost more wall clock than the iterations themselves.
+    """
+    project, dataset, table = ctx["project"], ctx["dataset"], ctx["table"]
+    iterations, target_s = ctx["iterations"], ctx["target_seconds"]
+
+    def sql_for(n: int) -> str:
+        return build_sql(project, dataset, table, trial, n, ctx.get("table_rows"))
+
+    # --- size the run (the pilot doubles as the warmup) ---
+    try:
+        if trial.rows is not None:
+            rows, pilot, capped = trial.rows, [], False
+            run_query(client, sql_for(min(PILOT_ROWS, rows)))
+        elif ctx["adaptive"]:
+            rows, pilot, capped = size_run(
+                client, sql_for, target_s, ctx["max_rows"],
+                floor_rows=PILOT_REQUESTS_PER_SLOT * cfg.slots * trial.batch)
+        else:
+            rows, pilot, capped = ctx["rows"], [], False
+            run_query(client, sql_for(PILOT_ROWS))
+    except Exception as exc:  # noqa: BLE001
+        print(f"    ! {trial.name}: pilot/warmup failed: {str(exc)[:200]}")
+        return []
+
+    note = "  [AT TABLE CEILING — run shorter than target]" if capped else ""
+    if pilot:
+        trace = " -> ".join(f"{r:,}r/{e:.1f}s" for r, e in pilot)
+        print(f"    pilot {trace}  => {rows:,} rows/iteration{note}")
+    time.sleep(3)
+
+    # --- iterations, back to back ---
+    windows: list[tuple[datetime, datetime, dict]] = []
+    sql = sql_for(rows)
+    for i in range(iterations):
+        t0 = datetime.now(timezone.utc) - timedelta(seconds=2)
+        try:
+            stats = run_query(client, sql)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    ! {trial.name} iter {i+1} failed: {str(exc)[:300]}")
+            continue
+        t1 = datetime.now(timezone.utc) + timedelta(seconds=2)
+        stats["rps"] = rows / stats["elapsed_s"] if stats["elapsed_s"] else 0
+        windows.append((t0, t1, stats))
+        print(f"    {trial.name} it{i+1}: {stats['elapsed_s']:.2f}s  "
+              f"{stats['rps']:,.0f} rps")
+
+    if not windows:
+        return []
+
+    # --- one log fetch for the whole cell, split by timestamp ---
+    time.sleep(LOG_SETTLE_S)
+    entries = fetch_log_entries(project, ctx["service"], windows[0][0], windows[-1][1])
+
+    records = []
+    for i, (t0, t1, stats) in enumerate(windows):
+        mine = [(ts, p) for ts, p in entries if t0 <= ts <= t1]
+        stats.update(summarise_entries(mine))
+        records.append({
+            "phase": phase_name,
+            "config": cfg.label,
+            **{f"cfg_{k}": v for k, v in asdict(cfg).items() if k != "label"},
+            "cfg_slots": cfg.slots,
+            "mode": trial.mode,
+            "function": trial.name,
+            "workload": trial.workload,
+            "batch": trial.batch,
+            "rows": rows,
+            "rows_at_ceiling": capped,
+            "iteration": i + 1,
+            "sentinel": sentinel,
+            **stats,
+        })
+
+    rps = [r["rps"] for r in records]
+    print(f"    -> {trial.name} @ {cfg.label}: median {statistics.median(rps):,.0f} rps "
+          f"(min {min(rps):,.0f} max {max(rps):,.0f}, {max(rps)/max(min(rps), 1):.2f}x "
+          f"spread over {len(rps)} runs)  "
+          f"conc_peak={records[-1].get('concurrency_peak','?')} "
+          f"procs={records[-1].get('worker_processes','?')} "
+          f"µs/row={records[-1].get('us_per_row_median','?')}")
+    return records
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", default="all",
-                    help=f"one of {sorted(PHASES)} or 'all'")
-    ap.add_argument("--rows", type=int, default=500_000)
+                    help=f"one of {sorted(PHASES)}, 'all', 'limits' or 'study'")
+    ap.add_argument("--rows", type=int, default=500_000,
+                    help="row count when --no-adaptive; otherwise only a fallback")
     ap.add_argument("--iterations", type=int, default=3)
     ap.add_argument("--out", default=None)
     ap.add_argument("--list", action="store_true",
                     help="print the plan and exit without deploying")
     ap.add_argument("--skip-deploy", action="store_true",
                     help="reuse the currently deployed revision (single-config runs)")
+    ap.add_argument("--adaptive", action="store_true",
+                    help="size each cell to --target-seconds instead of --rows. "
+                         "Required for the scaling study, whose cells differ in "
+                         "throughput by over 100x")
+    ap.add_argument("--target-seconds", type=float, default=25.0,
+                    help="wall-clock target per iteration under --adaptive")
+    ap.add_argument("--max-rows", type=int, default=20_000_000,
+                    help="ceiling on adaptive sizing. Above the source table's "
+                         "row count the table is replicated by cross join, so "
+                         "this is a cost guard, not a data limit")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip cells already complete in the output file")
+    ap.add_argument("--no-sentinel", action="store_true",
+                    help="skip the end-of-phase drift check (one extra deploy)")
+    # Parameterise the study phases without a phase per variant.
+    ap.add_argument("--workloads", help="comma-separated W-ids for workload_matrix")
+    ap.add_argument("--workload", help="single W-id for rule_check/scale_axis")
+    ap.add_argument("--slots", help="comma-separated slot counts for rule_check")
+    ap.add_argument("--workers", type=int, help="Phase 1 winner, for scale_axis")
+    ap.add_argument("--threads", type=int, help="Phase 1 winner, for scale_axis")
+    ap.add_argument("--worker-class", help="Phase 1 winner, for scale_axis")
     args = ap.parse_args()
+
+    OPTS.update({k: v for k, v in {
+        "workloads": args.workloads.split(",") if args.workloads else None,
+        "workload": args.workload,
+        "slots": [int(s) for s in args.slots.split(",")] if args.slots else None,
+        "workers": args.workers,
+        "threads": args.threads,
+        "worker_class": args.worker_class,
+    }.items() if v is not None})
 
     load()
     project = require("PROJECT_ID")
@@ -1133,15 +1728,17 @@ def main() -> int:
 
     known = sorted(PHASES) + sorted(PROBES)
     if args.phase == "all":
-        names = sorted(PHASES)
+        names = sorted(PHASES.keys() - set(STUDY_PHASES))
     elif args.phase == "limits":
         names = sorted(PROBES)
+    elif args.phase == "study":
+        names = list(STUDY_PHASES)
     else:
-        names = [args.phase]
+        names = args.phase.split(",")
     for n in names:
         if n not in PHASES and n not in PROBES:
-            print(f"unknown phase {n!r}; known: {known} (or 'all' / 'limits')",
-                  file=sys.stderr)
+            print(f"unknown phase {n!r}; known: {known} "
+                  f"(or 'all' / 'limits' / 'study')", file=sys.stderr)
             return 2
 
     perf_names = [n for n in names if n in PHASES]
@@ -1149,16 +1746,16 @@ def main() -> int:
 
     plan = [(n, cfg, trials) for n in perf_names for cfg, trials in PHASES[n]()]
     n_queries = sum(len(t) for _, _, t in plan) * args.iterations
+    sizing = (f"~{args.target_seconds:.0f}s/iteration, adaptive rows"
+              if args.adaptive else f"{args.rows:,} rows each")
 
     print(f"Sweep plan: {len(plan) + (1 if probe_names else 0)} deployment(s), "
-          f"{n_queries} measured queries "
-          f"({args.rows:,} rows each, {args.iterations} iteration(s))")
+          f"{n_queries} measured queries ({sizing}, {args.iterations} iteration(s))")
     for n, cfg, trials in plan:
-        modes = ",".join(sorted({t.mode for t in trials}))
-        batches = ",".join(str(t.batch) for t in trials)
+        fns = ",".join(t.name for t in trials)
         print(f"  [{n}] {cfg.label}: cpu={cfg.cpu} conc={cfg.concurrency} "
               f"w={cfg.workers} t={cfg.threads} {cfg.worker_class} "
-              f"max={cfg.max_instances} | modes={modes} batches={batches}")
+              f"slots={cfg.slots} mem={cfg.memory} max={cfg.max_instances} | {fns}")
     for n in probe_names:
         print(f"  [{n}] limit probe on {LIMIT_DEPLOYMENT.label} "
               f"(cpu={LIMIT_DEPLOYMENT.cpu} conc={LIMIT_DEPLOYMENT.concurrency} "
@@ -1167,83 +1764,80 @@ def main() -> int:
         return 0
 
     out_path = Path(args.out) if args.out else (
-        REPO_ROOT / "fpe" / "results" / f"sweep_raw_{args.phase}.jsonl"
+        REPO_ROOT / "fpe" / "results" / f"sweep_raw_{args.phase.replace(',', '-')}.jsonl"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sink = out_path.open("a")
 
+    # Resume: a study run is hours long, and losing it to one transient error
+    # would be worse than the small risk of mixing two runs' records. Cells are
+    # keyed on (phase, config, function), which is exactly what a cell is.
+    done: dict[tuple, int] = {}
+    if args.resume and out_path.exists():
+        for line in out_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("sentinel"):
+                continue
+            key = (r.get("phase"), r.get("config"), r.get("function"))
+            done[key] = done.get(key, 0) + 1
+        complete = sum(1 for v in done.values() if v >= args.iterations)
+        print(f"Resuming: {complete} cell(s) already complete in {out_path.name}")
+
+    sink = out_path.open("a")
     client = bigquery.Client(project=project)
     results: list[dict] = []
 
+    table_rows = client.get_table(f"{project}.{dataset}.{table}").num_rows
+    ctx = {
+        "project": project, "dataset": dataset, "table": table, "service": service,
+        "iterations": args.iterations, "target_seconds": args.target_seconds,
+        "adaptive": args.adaptive, "rows": args.rows, "table_rows": table_rows,
+        "max_rows": args.max_rows if args.adaptive else min(args.rows, table_rows),
+    }
+    if args.adaptive:
+        print(f"Adaptive sizing on: target {args.target_seconds:.0f}s/iteration, "
+              f"up to {args.max_rows:,} rows "
+              f"(source table has {table_rows:,}; replicated above that)")
+
+    def emit(records: list[dict]) -> None:
+        for rec in records:
+            results.append(rec)
+            sink.write(json.dumps(rec) + "\n")
+        sink.flush()
+
+    #: First cell of each phase, re-run at the end as a drift check.
+    first_of_phase: dict[str, tuple[Deployment, Trial]] = {}
+
     for phase_name, cfg, trials in plan:
+        first_of_phase.setdefault(phase_name, (cfg, trials[0]))
+        pending = [t for t in trials
+                   if done.get((phase_name, cfg.label, t.name), 0) < args.iterations]
+        if not pending:
+            print(f"\n=== [{phase_name}] {cfg.label} — already complete, skipping ===")
+            continue
+
         print(f"\n=== [{phase_name}] {cfg.label} "
               f"(cpu={cfg.cpu} conc={cfg.concurrency} workers={cfg.workers} "
-              f"threads={cfg.threads} {cfg.worker_class} max={cfg.max_instances}) ===")
+              f"threads={cfg.threads} {cfg.worker_class} slots={cfg.slots} "
+              f"mem={cfg.memory} max={cfg.max_instances}) ===")
         if not args.skip_deploy:
             deploy(cfg)
             # Let the revision settle and the autoscaler report steady state.
             time.sleep(10)
+        for trial in pending:
+            emit(run_cell(client, ctx, phase_name, cfg, trial))
 
-        for trial in trials:
-            sql = build_sql(project, dataset, table, trial, args.rows)
-
-            # Warm the instance: first request pays cipher construction and
-            # any lazy import cost, which would otherwise pollute iteration 1.
-            warm = build_sql(project, dataset, table, trial, 2000)
-            try:
-                run_query(client, warm)
-            except Exception as exc:  # noqa: BLE001
-                print(f"    ! warmup failed for {trial.mode}_b{trial.batch}: "
-                      f"{str(exc)[:200]}")
-                continue
-            time.sleep(3)
-
-            samples = []
-            for i in range(args.iterations):
-                t_start = datetime.now(timezone.utc) - timedelta(seconds=2)
-                try:
-                    stats = run_query(client, sql)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"    ! {trial.mode}_b{trial.batch} iter {i+1} failed: "
-                          f"{str(exc)[:300]}")
-                    continue
-                t_end = datetime.now(timezone.utc) + timedelta(seconds=2)
-
-                stats["rps"] = args.rows / stats["elapsed_s"] if stats["elapsed_s"] else 0
-                # Logs lag ingestion slightly; give them a moment to land.
-                time.sleep(LOG_SETTLE_S)
-                stats.update(summarise_logs(fetch_logs(project, service, t_start, t_end)))
-
-                record = {
-                    "phase": phase_name,
-                    "config": cfg.label,
-                    **{f"cfg_{k}": v for k, v in asdict(cfg).items() if k != "label"},
-                    "mode": trial.mode,
-                    "batch": trial.batch,
-                    "rows": args.rows,
-                    "iteration": i + 1,
-                    **stats,
-                }
-                samples.append(record)
-                results.append(record)
-                sink.write(json.dumps(record) + "\n")
-                sink.flush()
-
-                print(
-                    f"    {trial.mode}_b{trial.batch} it{i+1}: "
-                    f"{stats['elapsed_s']:.2f}s  {stats['rps']:,.0f} rps  "
-                    f"inst={stats.get('instances','?')} "
-                    f"procs={stats.get('worker_processes','?')} "
-                    f"inflight_max={stats.get('inflight_max','?')} "
-                    f"batch_med={stats.get('batch_rows_median','?')} "
-                    f"us/row={stats.get('us_per_row_median','?')}"
-                )
-
-            if samples:
-                el = [s["elapsed_s"] for s in samples]
-                print(f"    -> {trial.mode}_b{trial.batch} median "
-                      f"{statistics.median(el):.2f}s "
-                      f"({args.rows / statistics.median(el):,.0f} rps)")
+    # --- drift sentinel ---------------------------------------------------
+    # Configs are not interleaved (a deploy costs more than the iterations do),
+    # so drift over a multi-hour phase is a real threat to every comparison in
+    # it. Re-running the phase's first cell at the end tests for it directly.
+    if not args.no_sentinel and not args.skip_deploy:
+        for phase_name, (cfg, trial) in first_of_phase.items():
+            print(f"\n=== [{phase_name}] drift sentinel: re-running {cfg.label} ===")
+            deploy(cfg)
+            time.sleep(10)
+            emit(run_cell(client, ctx, phase_name, cfg, trial, sentinel=True))
 
     if probe_names:
         print(f"\n### Limit probes (deployment: {LIMIT_DEPLOYMENT.label}) ###")
