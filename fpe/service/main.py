@@ -17,8 +17,19 @@ backs every remote function in fpe/sql/. Modes:
     noop          echo the input                          (pure transit floor)
     cpu           N sha256 rounds per row                 (synthetic CPU knob)
     io            sleep once per batch                    (synthetic I/O knob)
+    io_row        sleep once per row                      (synthetic per-row I/O)
+    mixed         N sha256 rounds AND a sleep, per row    (spans the CPU/IO plane)
     bloat         echo widened to `width` chars per row    (response-size limit probe)
     error         fail `fail_pct` of batches with `fail_code` (retry-behaviour probe)
+
+`io` and `io_row` model genuinely different architectures and both are needed:
+`io` is one bulk downstream call per batch (the Protegrity service's shape),
+`io_row` is a remote call per row (the Developer Edition's shape). The first
+amortises to nothing over a large batch; the second does not amortise at all.
+
+`mixed` exists so the CPU/I-O *plane* can be spanned rather than only its two
+axes. A workload sitting at 70% CPU / 30% wait is not reachable by any of the
+single-axis modes, and that is exactly where real services live.
 
 Every request emits one structured JSON log line carrying pid, thread, batch
 size, in-flight concurrency and timings. That is the primary raw signal for the
@@ -163,6 +174,27 @@ def _apply(values: list[str], de: str, mode: str, params: dict) -> list[str]:
         # shape the Protegrity service actually has.
         time.sleep(float(params.get("sleep_ms", 50)) / 1000.0)
         return values
+    if mode == "io_row":
+        # One sleep per ROW, modelling a per-row remote call — the Developer
+        # Edition's shape. Unlike `io` this does not amortise over batch size,
+        # so a 12,000-row request costs 12,000 x sleep_ms of wall clock. Keep
+        # sleep_ms small, or the request outlives the Cloud Run timeout.
+        delay = float(params.get("sleep_ms", 5)) / 1000.0
+        for _ in values:
+            time.sleep(delay)
+        return values
+    if mode == "mixed":
+        # `rounds` of CPU AND `sleep_ms` of wait, per row, interleaved. The
+        # ratio between them is the wait/service ratio the worker-count rule is
+        # a function of, so this is the mode that spans the plane.
+        rounds = int(params.get("rounds", 0))
+        delay = float(params.get("sleep_ms", 0)) / 1000.0
+        out = []
+        for v in values:
+            out.append(_cpu_burn(v, rounds) if rounds else v)
+            if delay:
+                time.sleep(delay)
+        return out
     if mode == "bloat":
         # Deliberately inflate the response so a modest row count can cross
         # BigQuery's 15 MB remote-function response ceiling on demand.
@@ -221,12 +253,22 @@ def handle():
                 de = (call[1] if len(call) > 1 else None) or default_de or "ssn"
                 by_element.setdefault(str(de), []).append((i, str(value)))
 
+            # Wall clock AND CPU clock around the same work. Their ratio is the
+            # CPU share, and it is the second of the two numbers the Cloud Run
+            # scaling guide is keyed on: it says how much of a request is
+            # actually occupying a core rather than waiting, which is what
+            # decides whether extra slots should be processes or threads.
+            # thread_time, not process_time: under gthread several requests
+            # share a process, and process_time would charge each of them for
+            # all the others' CPU.
             t_work = time.perf_counter()
+            c_work = time.thread_time()
             for de, items in by_element.items():
                 out = _apply([v for _, v in items], de, mode, ctx)
                 for (idx, _), transformed in zip(items, out):
                     replies[idx] = transformed
             work_ms = (time.perf_counter() - t_work) * 1000
+            cpu_ms = (time.thread_time() - c_work) * 1000
 
             global _rows_total
             total_ms = (time.perf_counter() - t_start) * 1000
@@ -244,10 +286,17 @@ def handle():
                     "rows": len(calls),
                     "elements": {k: len(v) for k, v in by_element.items()},
                     "work_ms": round(work_ms, 3),
+                    "cpu_ms": round(cpu_ms, 3),
                     "total_ms": round(total_ms, 3),
                     "inflight": observed_concurrency,
                     "inflight_peak": _inflight_peak,
                     "us_per_row": round(work_ms * 1000 / max(len(calls), 1), 2),
+                    "cpu_us_per_row": round(cpu_ms * 1000 / max(len(calls), 1), 2),
+                    # 1.0 = the request held a core throughout; 0.0 = it waited
+                    # the whole time. Under contention this reads below 1 even
+                    # for pure CPU work, because the thread is descheduled —
+                    # which is exactly the signal that the box is oversubscribed.
+                    "cpu_share": round(cpu_ms / work_ms, 3) if work_ms > 0 else None,
                 }
             )
             return jsonify({"replies": replies})
