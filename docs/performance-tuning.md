@@ -35,8 +35,12 @@ results below are only visible from the second.
    `containerConcurrency`, 8 gthread threads in one process ran at 308 µs/row
    against 82 µs/row for 4 sync processes — the GIL serialises the work and the
    threads add contention.
-7. **~94% of end-to-end time is compute, not network.** The transit floor is
-   403,000 rows/s; FF3-1 runs at 26,000.
+7. **~94% of end-to-end time is compute, not network.** FF3-1 runs at 26,000
+   rows/s against a transit floor measured here at 403,000. *(The floor is
+   actually ~959,000 — the 403,000 figure was measured on 500,000-row queries,
+   which at that speed are half a second of mostly BigQuery start-up cost. See
+   [`cloud-run-scaling-guide.md` §3.6](cloud-run-scaling-guide.md). The
+   conclusion is unaffected and then some.)*
 8. **"Workers = vCPU" under-provisioned this service by 1.29x.** 16 gunicorn
    workers on 4 vCPU beat 4, with non-overlapping run ranges. The rule assumes
    pure-Python CPU burn; AES-in-C and socket I/O take processes off-core, and
@@ -44,6 +48,13 @@ results below are only visible from the second.
 9. **`containerConcurrency` barely matters above a floor.** Everything from 2 to
    80 was inside the run-to-run noise. Only `= 1` was clearly bad, by starving
    workers.
+10. **Every §7 number is for one workload, and §7 cannot tell you which of them
+    transfer to yours.** A follow-up study swept the workload as well as the
+    config, across seven points from 0.1 to 2,100 µs/row: measure two numbers
+    about your service and read the configuration off a table in
+    [`cloud-run-scaling-guide.md`](cloud-run-scaling-guide.md). It inverts §7's
+    vertical-vs-horizontal conclusion for cheap workloads, and its
+    threads-vs-processes conclusion for wait-bound ones.
 
 ---
 
@@ -1002,9 +1013,21 @@ other direction.
 
 What generalises is the method, not the number 4: fix everything else, set
 concurrency high, sweep workers, and check whether the run ranges overlap before
-believing a difference. Turning that method into a lookup table — measure two
-numbers about your workload, read off the config — is planned in
-[`plans/cloud-run-scaling-decision-guide.md`](plans/cloud-run-scaling-decision-guide.md).
+believing a difference.
+
+**That has since been turned into a lookup table.**
+[`cloud-run-scaling-guide.md`](cloud-run-scaling-guide.md) sweeps the *workload*
+as well as the config — seven points from 0.1 to 2,100 µs/row — so you can
+measure two numbers about your own service and read the configuration off a
+table. Its short version, for this subsection's question:
+
+- **CPU share ≥ 0.9** (the case here): `sync`, 4x vCPU workers. Threads are
+  2.5–3.9x worse at identical slot counts.
+- **CPU share < 0.05**: `gthread`, 64–128 slots. Threads and processes are
+  throughput-*equivalent* there, and threads use one eighth of the memory.
+- The "4x vCPU" figure is not universal even within the CPU-bound regime — it
+  is right at 5 µs/row and at 87 µs/row, but 30 µs/row was already optimal at
+  1x vCPU.
 
 ### Vertical vs horizontal scaling
 
@@ -1152,9 +1175,15 @@ queue depth trips 429s — at which point BigQuery's retry behaviour (§2: 99
 invocations for 5 partitions) amplifies the load rather than shedding it.
 
 **What this does not change.** None of §7's tuning conclusions move: still
-`workers = vCPU`, still no threads for CPU-bound work, still horizontal before
-vertical. The scenario changes the sizing arithmetic, not the shape of the
-service.
+16 workers on 4 vCPU rather than the 4 that "workers = vCPU" would give, still
+no threads for CPU-bound work, still horizontal before vertical. The scenario
+changes the sizing arithmetic, not the shape of the service.
+
+That does move the arithmetic above, though, and in the direction of needing
+less. Every figure in this subsection is built on the ~21,000 rows/s a 4-vCPU
+instance managed at `workers = vCPU`; the worker sweep measured 34,737 rows/s
+from the same instance at 16 workers. Read the instance counts here as an upper
+bound with roughly 1.6x of headroom in them.
 
 **And check whether you need any of it.** 300 concurrent queries is an ordinary
 interactive workload. 300 concurrent queries each pushing 1,000,000 rows through
@@ -1263,6 +1292,26 @@ the sweeps, and read µs/row off the logs. Compare against the three rows above:
 near `hmac` means tune batching, near `fpe_decrypt` means tune workers. Every
 BigQuery-side finding in §§1–6 applies either way.
 
+**Two of the three bullets above have since been measured, and one is wrong.**
+[`cloud-run-scaling-guide.md`](cloud-run-scaling-guide.md) synthesises the
+single-digit-µs/row regime directly (its W2 point, 4.3 µs/row measured) instead
+of reasoning about it:
+
+- *"Worker count matters little"* — **wrong**. 1 → 16 workers is a 2.3x gain
+  with non-overlapping ranges, the same shape as FF3-1.
+- *"Batch size matters more"* — **right**. Dropping to 100 rows/request costs
+  5.63x rather than FF3-1's 1.50x, and unlike here the top of the curve is not
+  flat either: 50,000 rows/request beats 1,000 by 1.24x with non-overlapping
+  ranges.
+- *"Instance count matters little"* — **right**, and more strongly than
+  expected: `maxScale` is inert and Cloud Run never leaves one instance,
+  because a 16-slot instance absorbs everything BigQuery offers.
+
+So a production PEP wants the same shape as this service — `sync`, ~4x vCPU
+workers, `containerConcurrency` 80 — and scales **vertically**, not
+horizontally. Only the throughput changes: ~417,000 rows/s per 4-vCPU instance
+rather than ~35,000.
+
 ### Developer Edition only
 
 If you *are* running the Developer Edition code in this repo, then it is
@@ -1273,8 +1322,18 @@ to **one sync worker**, handling one request at a time, while the session cache
 sits behind a `threading.Lock`
 ([`main.py:16-38`](../protegrity/service/main.py#L16)) that protects nothing.
 Sync workers would also each hold their own session, multiplying login traffic
-against a rate-limited API, where threads share one. None of this is measured —
-the access needed to test it is gone.
+against a rate-limited API, where threads share one.
+
+The Protegrity service itself still cannot be measured — the vendor access is
+gone — but **its shape now has been**.
+[`cloud-run-scaling-guide.md`](cloud-run-scaling-guide.md)'s W5 point is a
+synthetic per-row remote call at a 2 ms round trip, which is exactly this
+architecture, and one sync worker is the worst configuration in the whole study:
+466 rows/s, against 11,602 at 64 threaded slots — **25x**. The threads-versus-
+processes question is settled there too, and in favour of threads for a reason
+stronger than memory: at that CPU share the two are throughput-*equivalent*
+(3,718 vs 3,700 rows/s at 8 slots), so threads win purely on the 8x memory
+saving and the shared session.
 
 ---
 
@@ -1293,15 +1352,21 @@ Ordered by the size of the effect measured here.
    1,000,000 → 1 row). Better still, have the caller supply an already-known
    token: that query contains no remote function at all, so it escapes the
    10-concurrent-query limit entirely.
-4. **Scale horizontally.** `maxScale` 1→8 gave 3.2x; it beats vCPU per unit of
-   effort and avoids worker oversubscription.
+4. **Scale horizontally — but only if one instance cannot absorb the offered
+   concurrency.** `maxScale` 1→8 gave 3.2x for FF3-1, where each request is
+   ~0.6 s and requests queue. At 4 µs/row it gave *nothing*, and Cloud Run never
+   left one instance: no queue, no autoscaling
+   ([guide §3.4](cloud-run-scaling-guide.md)). Vertical is the reliable lever
+   for cheap workloads (3.8x from 1→8 vCPU).
 5. **Sweep gunicorn workers; do not assume workers = vCPU.** That rule
    under-provisioned this service by 1.29x — 16 workers on 4 vCPU beat 4, with
    non-overlapping run ranges, because AES-in-C and socket I/O take processes
-   off-core. Threads are still no substitute: 3.3x *worse* per row than
-   processes. `containerConcurrency` only needs to be **>= workers** so nothing
-   starves; above that it made no measurable difference, so leave it at the
-   default.
+   off-core. Threads are no substitute *for CPU-bound work*: 3.3x worse per row
+   than processes here, and 2.5–3.9x worse across the guide's CPU-bound points.
+   Below a CPU share of ~0.05 that reverses into a tie, and then threads win on
+   memory by 8x. `containerConcurrency` only needs to be **>= workers** so
+   nothing starves; above that it made no measurable difference, so leave it at
+   the default.
 6. **Detokenize after `LIMIT` and after aggregation** (5–22x). Don't bother
    restructuring `WHERE` — BigQuery already pushes it down.
 7. **Return 400, not 500**, for deterministic errors, or pay up to 20 retries

@@ -32,8 +32,9 @@ about BigQuery's protocol rather than the crypto —
 ```text
 ├── config/                   # shared.env contract (see below)
 ├── docs/
-│   ├── performance-tuning.md # the study — applies to BOTH demos, start here
-│   └── plans/                # designed-but-not-yet-run follow-up studies
+│   ├── performance-tuning.md      # the study — applies to BOTH demos, start here
+│   ├── cloud-run-scaling-guide.md # measure two numbers, look up the Cloud Run config
+│   └── plans/                     # follow-up studies, run and unrun
 ├── shared/
 │   └── generate_mock_data.py # PII mock data generator, used by both demos
 ├── fpe/                      # vendor-free demo, and the measurement rig
@@ -101,5 +102,14 @@ part of this repo. It measures, on real infrastructure:
 - the query shapes that silently disable batching and cost you ~180x;
 - authorized-view + entitlement patterns for row- and column-level access
   control that keep batching intact.
+
+Its Cloud Run tuning section is for one workload, though — pure-Python FF3-1 at
+~87 µs/row — and those numbers do not generalise.
+[`docs/cloud-run-scaling-guide.md`](docs/cloud-run-scaling-guide.md) fixes that
+by sweeping the *workload* as well as the config, across seven points from 0.1
+to 2,100 µs/row: profile your own service for two numbers (µs/row and CPU
+share) and read the worker model, worker count and scaling axis off a table.
+It answers, with measurements rather than reasoning, what a production
+Protegrity PEP and the Developer Edition each want — and they are opposites.
 
 Reproduce any of it with `python fpe/scripts/sweep.py --phase <name>`.
