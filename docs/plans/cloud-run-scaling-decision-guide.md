@@ -1,6 +1,11 @@
 # Plan: Cloud Run scaling behaviour as a function of workload characteristics
 
-**Status:** not started. Written as a handoff for a fresh session.
+**Status: DONE (2026-08-28).** Deliverable shipped as
+[`docs/cloud-run-scaling-guide.md`](../cloud-run-scaling-guide.md); raw records
+under [`fpe/results/sweep_raw_study_*.jsonl`](../../fpe/results/); generated
+tables in [`fpe/results/scaling-tables.md`](../../fpe/results/scaling-tables.md).
+**Deviations from the plan as written are in §8 at the bottom — read that
+before comparing anything here against the code.**
 **Goal:** replace "here is what worked for *our* workload" with "measure these
 two numbers about your workload, look up the config".
 
@@ -168,6 +173,36 @@ service, plausible for AES-in-C plus socket time.
   inside the measured optimum's range. A rule that was only ever fitted is not a
   finding.
 
+#### Pre-registered prediction for W7 (written before the run, 2026-08-27)
+
+W7 is `mixed`, 50 µs CPU + 1 ms wait per row, so wait/service = 20 and the
+plan's rule gives `4 x (1 + 20) = 84` slots.
+
+Phase 1 contradicts that rule on its own terms, in two ways:
+
+1. **Reconstructed peak concurrency never exceeded 32**, in any of the 39 cells,
+   including four provisioned with 64 slots. BigQuery does not offer more than
+   ~32 concurrent requests to one endpoint for a single query, so slots beyond
+   that cannot be filled whatever the workload wants.
+2. **The rule already fails on the pure-CPU points.** It predicts 4 slots for
+   W2/W3/W4 (wait/service = 0) and the measured knees are 16, 4 and 16. Nominal
+   CPU cost is not the whole service time: per-request JSON and socket work sits
+   outside the handler and is partly off-core.
+
+So the prediction under test is **not** the plan's rule but the rule the Phase 1
+data actually supports:
+
+> `slots = min(cores x (1 + wait/service), ~32)` — and for W7 that is **32**.
+
+Concretely, three falsifiable claims:
+
+- **P1.** W7's throughput knee is at 32 slots.
+- **P2.** 64 and 128 slots are statistically indistinguishable from 32 (ranges
+  overlap), i.e. the naive answer of 84 buys nothing.
+- **P3.** 8 and 16 slots are measurably slower than 32 (ranges disjoint).
+
+Any of these failing falsifies the capped rule.
+
 ### Phase 3 — the scaling axis
 
 For each workload's best per-instance config from Phase 1:
@@ -219,16 +254,104 @@ where a production PEP lands should be answerable by it.
 
 ## 6. Definition of done
 
-- [ ] A reader with an unmeasured workload can pick a Cloud Run config from the
+- [x] A reader with an unmeasured workload can pick a Cloud Run config from the
       guide using two numbers they can obtain in one query.
-- [ ] Every recommendation cites a measurement or is explicitly marked as
-      interpolated.
-- [ ] The Phase 2 rule survived a falsification attempt on a held-out point.
-- [ ] No claimed difference rests on ranges that overlap.
-- [ ] `docs/performance-tuning.md` §7 no longer implies its numbers generalise.
-- [ ] Raw JSONL committed under `fpe/results/`, identifiers scrubbed.
+      → [guide §1–2](../cloud-run-scaling-guide.md); `sweep.py --phase profile`
+      runs the recipe, and `main.py` now emits `cpu_share` per batch.
+- [x] Every recommendation cites a measurement or is explicitly marked as
+      interpolated. → guide §5 splits them explicitly.
+- [x] The Phase 2 rule survived a falsification attempt on a held-out point.
+      → guide §3.3. The plan's rule survived at the edge of its band; the
+      amendment this study proposed was falsified outright.
+- [x] No claimed difference rests on ranges that overlap. → `analyze.py`
+      enforces it in `rank_by_rps`; every study table carries the verdict.
+- [x] `docs/performance-tuning.md` §7 no longer implies its numbers generalise.
+      → headline finding 10, the worker subsection, the Protegrity section and
+      checklist items 4–5 all now point at the guide and record what inverted.
+- [x] Raw JSONL committed under `fpe/results/`, identifiers scrubbed. → seven
+      `sweep_raw_study_*.jsonl` files; scanned for project id, project number,
+      `run.app` host and email, all absent (records carry only config, timings
+      and opaque BigQuery job UUIDs).
 
-## 7. Open questions worth resolving on the way
+## 7. Open questions worth resolving on the way — answered
+
+- **Does `containerConcurrency` stay a no-op above the floor for *cheap*
+  workloads?** Not re-swept in isolation, but it was held at 80 across all 39
+  matrix cells while slots varied from 1 to 64, and nothing in the results
+  suggests it bound anything. The floor rule (`concurrency >= slots`) is what
+  matters; the study raised it above 80 only when slots exceeded 40. **Cloud Run
+  rejects `containerConcurrency` above 1000**, which is a real ceiling on the
+  single-instance slot count and is now enforced in `_matrix_deployment`.
+- **Does CPU throttling behave differently for bursty cheap requests?** Not
+  run. Dropped deliberately: §7 found no effect at W4 and the two numbers ran
+  the wrong way round, and the study's budget went to the worker-model matrix
+  instead. Still open.
+- **Is there a memory-per-worker ceiling worth documenting?** Yes, and it is now
+  the main argument for threads. 32 `sync` workers needed **16Gi** (each is a
+  full interpreter with ff3/pycryptodome, ~70 MB RSS); 32 threads in one process
+  ran the same workload at the same throughput in **2Gi**. For a wait-bound
+  service that 8x is the whole reason to prefer `gthread`, because throughput
+  alone is a tie.
+
+---
+
+## 8. Deviations from this plan, and why
+
+Recorded because the plan is checked in and the code no longer matches it in
+these places.
+
+1. **W5/W6 use 2 ms and 1 ms per-row waits, not 20 ms.** A 20 ms per-row sleep
+   is 50 rows/s per slot: saturating 64 slots needs requests of 5,000 x 20 ms =
+   100 s, and the matching single-slot run would take over two hours. 2 ms keeps
+   the same *shape* — a blocking per-row remote call — inside a measurable
+   dynamic range, and is a realistic same-region API latency.
+2. **W6 and W7 were re-specified.** The plan's W6 (20 µs + 20 ms) has
+   wait/service = 1000, which predicts ~4,000 slots — unreachable, so it could
+   not test the rule. They became 100 µs + 1 ms (ratio 10) and 50 µs + 1 ms
+   (ratio 20), which put the predicted optimum inside the deployable range.
+3. **Adaptive row counts replaced the fixed 400k.** Cells in this study differ
+   in throughput by over 2,000x, so no single row count gives all of them a
+   measurable run. Each cell is piloted and sized to ~25 s. Throughput is a
+   rate, so this stays comparable. Above the 1,000,000-row source table the
+   table is replicated by cross join.
+4. **No interleaving.** The plan asked the protocol to decide; it decided
+   against. A deploy is ~75 s against ~125 s of iterations, so interleaving
+   configs would have multiplied the run's cost by the iteration count. A
+   per-phase **drift sentinel** — redeploy and re-run the phase's first config
+   at the end — tests the same assumption for one extra deploy. Three of four
+   phases showed no drift; the fourth drifted 4.5%.
+5. **One log fetch per cell, not per iteration.** `LOG_SETTLE_S` is 20 s, which
+   at 5 iterations cost more than the iterations did. Iterations run back to
+   back and the window is split by timestamp.
+6. **A second measured number was added: CPU share.** The plan named "per-row
+   cost and CPU share" as the two lookup keys but no instrument produced the
+   second. `main.py` now times each batch on `time.thread_time()` as well as
+   `time.perf_counter()`. This is what makes the deliverable usable on a service
+   nobody has swept — and it is why the guide's decision table is keyed
+   primarily on CPU share rather than on µs/row.
+7. **The Phase 1 matrix was trimmed from 60 cells to 39**, as §4 instructed:
+   full worker-model coverage for W2 and W5 (the two real deployment shapes),
+   the gthread arm only for W4 (its sync arm is §7's `workers_only`), and
+   shape-establishing subsets for W1 and W3.
+8. **Phase 2 tested two rules, not one.** Phase 1 suggested an amendment — peak
+   concurrency never exceeded 32, so slots beyond that looked unfillable — and
+   that amendment was pre-registered alongside the plan's original rule. The
+   amendment was falsified (128 slots beat 32 by 2.2x with disjoint ranges); the
+   plan's rule survived at the edge of its band. The lesson is in the guide: a
+   metric that saturates is not automatically the constraint.
+9. **`cpu` mode's calibration lives in `fpe/scripts/calibration.py`**, not in
+   `sweep.py` as the plan said, because `generate_remote_functions.py` needs it
+   too — the `rounds` value is baked into each remote function's name.
+
+## 9. Left undone
+
+- **CPU throttling at a cheap workload** (see §7 above).
+- **W6 above 64 slots.** Its optimum may be higher than the 32 recorded.
+- **W5 above 64 slots.** Same — W7 was still improving at 128.
+- **Where the `sync`/`gthread` crossover sits.** Bracketed between CPU share
+  0.10 and 0.012; a workload at ~0.03 would locate it.
+- **Instance sizes other than 4 vCPU** for anything except the two `scale_axis`
+  arms.
 
 - Does `containerConcurrency` stay a no-op above the floor for *cheap*
   workloads? It was noise-dominated at W4; at W1/W2 per-request overhead is a
