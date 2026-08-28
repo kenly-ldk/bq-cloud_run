@@ -15,6 +15,7 @@ plus unsuffixed fpe_encrypt / fpe_decrypt at the default batch size for demo use
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -24,8 +25,20 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from config._loader import load, require  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from calibration import CONTAINER  # noqa: E402
+from workloads import WORKLOADS  # noqa: E402
+
 #: Batch sizes for the main performance sweep.
 BATCH_SIZES = [100, 500, 1000, 2500, 5000, 10000, 25000, 50000]
+
+#: `rounds` values for the container calibration probe. Spans two orders of
+#: magnitude so the fit is not anchored on one point, and starts low because
+#: the interesting end of the study — a native-code PEP at single-digit µs/row —
+#: lives there. Small batch: these requests should be short, not saturating.
+CALIBRATION_ROUNDS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+CALIBRATION_BATCH = 2500
 
 #: Oversized batches used only to probe BigQuery's documented ceilings:
 #:   HTTP response size (Cloud Run / gen2) = 15 MB
@@ -137,6 +150,57 @@ def build_sql(project: str, dataset: str, connection: str, endpoint: str) -> str
         parts.append(
             _render(project, dataset, name, connection, endpoint,
                     _context(mode, ctx), batch)
+        )
+
+    parts.append(
+        f"\n-- === Container CPU calibration (rounds -> µs/row) ===\n"
+        f"-- Read by sweep.py --phase calibrate_cpu. Current container curve:\n"
+        f"--   us_per_row = {CONTAINER.floor_us:.2f} "
+        f"+ {CONTAINER.us_per_round:.4f} * rounds  ({CONTAINER.measured_on})"
+    )
+    for rounds in CALIBRATION_ROUNDS:
+        parts.append(
+            _render(project, dataset, f"cpu_r{rounds}_b{CALIBRATION_BATCH}",
+                    connection, endpoint,
+                    _context("cpu", {"rounds": str(rounds)}), CALIBRATION_BATCH)
+        )
+
+    parts.append(
+        "\n-- === Scaling-study workload points (fpe/scripts/workloads.py) ===\n"
+        "-- One function per point. The cost parameters are baked into the name,\n"
+        "-- so re-calibrating the container curve renames the functions rather\n"
+        "-- than silently changing what a stale name measures."
+    )
+    emitted = set(re.findall(r"\.(\w+)\(val STRING", "\n".join(parts)))
+    for w in WORKLOADS.values():
+        parts.append(
+            f"-- {w.id}: {w.represents} "
+            f"({w.cpu_us:g} µs CPU + {w.wait_ms} ms wait per row)"
+        )
+        if w.function in emitted:
+            # W1/W4 reuse a mode x batch cell the grid above already defines;
+            # re-emitting it would be a second CREATE OR REPLACE of the same body.
+            parts.append(f"--   uses {w.function}, already defined above")
+            continue
+        emitted.add(w.function)
+        parts.append(
+            _render(project, dataset, w.function, connection, endpoint,
+                    _context(w.mode, w.params), w.batch)
+        )
+
+    # Phase 3's batch-size sweep re-runs §7's batch question at a *cheap*
+    # workload, where per-request overhead is a much larger share of the cost.
+    cheap = WORKLOADS["W2"]
+    parts.append(
+        f"\n-- === Batch-size sweep at {cheap.id} "
+        f"({cheap.cpu_us:g} µs/row) ===")
+    for batch in BATCH_SIZES:
+        if batch == cheap.batch:
+            continue  # already emitted above
+        parts.append(
+            _render(project, dataset, f"{cheap.mode}{cheap.tag}_b{batch}",
+                    connection, endpoint,
+                    _context(cheap.mode, cheap.params), batch)
         )
     return "\n".join(parts)
 
